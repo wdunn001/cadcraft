@@ -61,6 +61,44 @@ fn title_left(left: f32, width: f32, text_w: f32) -> f32 {
     (left + (width - text_w) / 2.0).max(left + MAC_CONTENT_LEFT)
 }
 
+/// The cloud controls (account badge, share button) placed at the right end of the toolbar row.
+///
+/// Returns the x coordinate where the rightmost cloud control begins, so the toolbar knows
+/// how much space to leave. Returns `right` unchanged when nothing cloud-shaped is drawn.
+fn cloud_controls(app: &mut CadApp, ui: &mut egui::Ui, row: egui::Rect) -> f32 {
+    if !crate::cloud::available(app) {
+        return row.right();
+    }
+    // Lay out right-to-left so the share button is outermost, then the
+    // account badge, matching the convention every other Craft app uses.
+    let mut rx = row.right() - 8.0;
+    // Share split button: only drawn where the provider supports sharing.
+    if crate::cloud::shares(app) {
+        let copies = crate::cloud::copies();
+        // Allocate a fixed region and draw into it with a temporary sub-ui.
+        // 90 pt is wide enough for "Share ▾" in every supported language at 12 pt.
+        let share_w = 90.0;
+        rx -= share_w;
+        let share_rect = egui::Rect::from_min_size(egui::pos2(rx, row.center().y - 14.0), egui::vec2(share_w, 28.0));
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(share_rect));
+        if let Some(copy_id) = crate::cloud::share_button(app, &mut child, &copies) {
+            app.start(&copy_id);
+        }
+        rx -= 8.0;
+    }
+    // Account badge (who is signed in, plus presence avatars for collaborators).
+    // craft_ui::cloud::who measures itself; reserve up to 200 pt.
+    let who_max = 200.0_f32.min(rx - row.left() - 120.0).max(0.0);
+    if who_max > 24.0 {
+        rx -= who_max;
+        let who_rect = egui::Rect::from_min_size(egui::pos2(rx, row.center().y - 14.0), egui::vec2(who_max, 28.0));
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(who_rect));
+        crate::cloud::who(app, &mut child);
+        rx -= 8.0;
+    }
+    rx
+}
+
 /// Title row (with the integrated macOS title bar) and the Tool Bar.
 pub fn title_and_toolbar(app: &mut CadApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
@@ -91,12 +129,16 @@ pub fn title_and_toolbar(app: &mut CadApp, ui: &mut egui::Ui) {
         }
         if tb_h > 0.0 {
             let row = Rect::from_min_size(pos2(r.left(), r.top() + title_h), vec2(r.width(), tb_h));
+            // Place cloud controls first (right-aligned) so we know how much room
+            // the toolbar commands have. `cloud_right` is the left edge of the
+            // cloud region (toolbar must not reach past it).
+            let cloud_right = cloud_controls(app, ui, row);
             let mut x = r.left() + if app.integrated_titlebar { 120.0 } else { 12.0 };
             let size = 26.0;
             let mut clicked = None;
             let mac = ui.ctx().os().is_mac();
             let widths: Vec<_> = TOOLBAR.iter().map(|group| group.len() as f32 * (size + 6.0) - 6.0).collect();
-            let available = (row.right() - 12.0 - x).max(0.0);
+            let available = (cloud_right - 12.0 - x).max(0.0);
             let Some(fit) = craft_ui::layout::fit_toolbar(&widths, available, 24.0, 30.0) else {
                 // Very small windows still expose the complete command row by scrolling.
                 ui.scope_builder(egui::UiBuilder::new().max_rect(row.shrink2(vec2(4.0, 0.0))), |ui| {
@@ -471,6 +513,11 @@ pub fn start_page(app: &mut CadApp, ui: &mut egui::Ui) {
         }
         y += 44.0;
     }
+    // Cloud file list in the left column, below the local commands.
+    let left_cloud = Rect::from_min_max(pos2(left.left() + 12.0, y + 12.0), pos2(left.right() - 12.0, left.bottom() - 12.0));
+    ui.scope_builder(egui::UiBuilder::new().max_rect(left_cloud), |ui| {
+        crate::cloud::open_section(app, ui);
+    });
     let main = Rect::from_min_max(pos2(left.right() + 36.0, r.top() + 40.0), r.max);
     p.text(main.min, egui::Align2::LEFT_TOP, crate::tl!("Recent"), egui::FontId::proportional(22.0), t.text);
     p.text(

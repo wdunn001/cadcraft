@@ -11,9 +11,12 @@ workspace = true
 
 [dependencies]
 craft-ui = { workspace = true }
+# Vendor-neutral cloud types (Entry, Capability, EntryKind) re-exported for the host app.
+craft-cloud = { workspace = true }
 cadcraft-geom = { workspace = true }
 cadcraft-color = { workspace = true }
 cadcraft-doc = { workspace = true }
+cadcraft-io = { workspace = true }
 cadcraft-render = { workspace = true }
 cadcraft-engine = { workspace = true }
 egui = { workspace = true }
