@@ -69,34 +69,31 @@ fn cloud_controls(app: &mut CadApp, ui: &mut egui::Ui, row: egui::Rect) -> f32 {
     if !crate::cloud::available(app) {
         return row.right();
     }
-    // Lay out right-to-left so the share button is outermost, then the
-    // account badge, matching the convention every other Craft app uses.
-    let mut rx = row.right() - 8.0;
-    // Share split button: only drawn where the provider supports sharing.
-    if crate::cloud::shares(app) {
-        let copies = crate::cloud::copies();
-        // Allocate a fixed region and draw into it with a temporary sub-ui.
-        // 90 pt is wide enough for "Share ▾" in every supported language at 12 pt.
-        let share_w = 90.0;
-        rx -= share_w;
-        let share_rect = egui::Rect::from_min_size(egui::pos2(rx, row.center().y - 14.0), egui::vec2(share_w, 28.0));
-        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(share_rect));
-        if let Some(copy_id) = crate::cloud::share_button(app, &mut child, &copies) {
-            app.start(&copy_id);
-        }
-        rx -= 8.0;
+    // Use one measured right-to-left row instead of separate fixed-width
+    // children. The old 200 pt account reservation left the avatar floating
+    // far away from Share and made both menus look detached from their
+    // controls. Keep the account at the outer edge and Share immediately
+    // beside it, matching the other Craft applications.
+    let controls_rect = egui::Rect::from_min_max(
+        egui::pos2((row.left() + 120.0).min(row.right() - 8.0), row.top()),
+        egui::pos2(row.right() - 8.0, row.bottom()),
+    );
+    let mut controls = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(controls_rect)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    controls.spacing_mut().item_spacing.x = 8.0;
+    let available_before = controls.available_width();
+
+    crate::cloud::who(app, &mut controls);
+    if crate::cloud::shares(app)
+        && let Some(copy_id) = crate::cloud::share_button(app, &mut controls, &crate::cloud::copies())
+    {
+        app.start(&copy_id);
     }
-    // Account badge (who is signed in, plus presence avatars for collaborators).
-    // craft_ui::cloud::who measures itself; reserve up to 200 pt.
-    let who_max = 200.0_f32.min(rx - row.left() - 120.0).max(0.0);
-    if who_max > 24.0 {
-        rx -= who_max;
-        let who_rect = egui::Rect::from_min_size(egui::pos2(rx, row.center().y - 14.0), egui::vec2(who_max, 28.0));
-        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(who_rect));
-        crate::cloud::who(app, &mut child);
-        rx -= 8.0;
-    }
-    rx
+
+    row.right() - 8.0 - (available_before - controls.available_width())
 }
 
 /// Title row (with the integrated macOS title bar) and the Tool Bar.

@@ -122,7 +122,8 @@ fn offer_login() {
     let _ = window.location().set_href("/auth/login");
 }
 
-/// POST to `/logout` with the session cookie, which the service clears.
+/// POST to `/auth/logout` with the session cookie, which the CollabCraft
+/// service clears (the old `/logout` stub no longer exists).
 async fn fetch_logout() -> Result<(), String> {
     let global = js_sys::global();
     let fetch = js_sys::Reflect::get(&global, &wasm_bindgen::JsValue::from_str("fetch"))
@@ -132,9 +133,23 @@ async fn fetch_logout() -> Result<(), String> {
     let init = web_sys::RequestInit::new();
     init.set_method("POST");
     init.set_credentials(web_sys::RequestCredentials::Include);
-    let req = web_sys::Request::new_with_str_and_init("/logout", &init).map_err(|e| format!("{e:?}"))?;
+    let req = web_sys::Request::new_with_str_and_init("/auth/logout", &init).map_err(|e| format!("{e:?}"))?;
     let promised = fetch.call1(global.as_ref(), req.as_ref()).map_err(|e| format!("{e:?}"))?;
     let promised: js_sys::Promise = promised.dyn_into().map_err(|_| "not a promise".to_owned())?;
     wasm_bindgen_futures::JsFuture::from(promised).await.map_err(|e| format!("{e:?}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// The logout path must match the CollabCraft route. A plain `/logout`
+    /// stub was removed; the correct endpoint is `/auth/logout`.
+    #[test]
+    fn logout_path_is_auth_logout() {
+        let src = include_str!("cloud.rs");
+        // Must contain the CollabCraft path.
+        assert!(src.contains("/auth/logout"), "fetch_logout must POST to /auth/logout");
+        // Must NOT contain the old stub path as a bare string literal.
+        assert!(!src.contains("\"/logout\""), "fetch_logout must not use the old /logout stub");
+    }
 }
