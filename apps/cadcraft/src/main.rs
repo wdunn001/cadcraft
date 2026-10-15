@@ -14,6 +14,7 @@
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod cloud;
 mod control_server;
 mod desktop_theme;
 #[cfg(any(target_os = "windows", test))]
@@ -282,6 +283,14 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let mut app = CadApp::new(Session::empty(), services());
+            // Wire the cloud worker when a service is configured.
+            if let Some(svc) = cloud::service(cc.egui_ctx.clone()) {
+                app.cloud.connect(svc);
+            }
+            // The share dialog reaches the same service through its own client
+            // built per request, so a session collected later is picked up
+            // without a restart.
+            app.share.connect(collabcraft_share::CollabCraft::from_fn(cloud::client));
             let (workspace, restored, workspace_error) = workspace::Workspace::load();
             if let Some(ui) = restored {
                 app.ui = ui;

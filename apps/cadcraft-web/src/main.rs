@@ -10,6 +10,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 #[cfg(target_arch = "wasm32")]
+mod cloud;
+#[cfg(target_arch = "wasm32")]
 pub mod download;
 #[cfg(target_arch = "wasm32")]
 mod host;
@@ -112,6 +114,13 @@ mod web {
                         // Embedded, the parent sends the drawing: start on the Start tab, not Drawing1.
                         let session = if app_bridge.is_some() { Session::empty() } else { Session::new() };
                         let mut app = CadApp::new(session, services());
+                        // Wire the browser cookie transport when the page is served by
+                        // CollabCraft. Nothing is compiled in; the page names the service.
+                        app.cloud.connect(crate::cloud::Service::new(cc.egui_ctx.clone()));
+                        if let Some(share) = collabcraft_share::CollabCraft::from_env() {
+                            app.share.connect(share);
+                        }
+                        cadcraft_ui_egui::cloud::start(&mut app);
                         app.system_languages =
                             web_sys::window().map(|w| w.navigator().languages().iter().filter_map(|v| v.as_string()).collect()).unwrap_or_default();
                         if let Some(profile) = cc.storage.and_then(|s| s.get_string(cadcraft_ui_egui::options::PROFILE_KEY)) {

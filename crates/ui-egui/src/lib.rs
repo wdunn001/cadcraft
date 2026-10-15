@@ -13,6 +13,7 @@ pub mod canvas;
 pub mod chrome;
 pub mod clipboard;
 pub mod closing;
+pub mod cloud;
 pub mod cmdline;
 pub mod context_menu;
 pub mod control;
@@ -187,6 +188,22 @@ pub struct CadApp {
     pub cmd: cmdline::CmdLine,
     pub status: Option<(String, f64)>,
     pub integrated_titlebar: bool,
+    // ---- cloud storage -------------------------------------------------------
+    /// The Open / Save / Share / account state kept by craft_ui::cloud.
+    pub cloud: craft_ui::cloud::CloudFiles,
+    /// The share dialog (drawn by craft_ui::share).
+    pub share: craft_ui::share::ShareDialog,
+    /// Who else is editing this drawing right now (craft_ui::presence).
+    pub presence: craft_ui::presence::PresenceBar,
+    /// Which cloud modal is open (Open or Save), when one is.
+    pub cloud_page: Option<cloud::Page>,
+    /// Whether the next Save As should default to the cloud destination.
+    pub save_to_cloud: Option<bool>,
+    /// The drawing snapshot each in-flight cloud save encoded, keyed by drawing uid.
+    pub cloud_sent: cloud::Sent,
+    /// The egui context, for opening URLs (stored after the first frame).
+    pub egui_ctx: Option<egui::Context>,
+    // ---- control channel -----------------------------------------------------
     control_rx: Option<Receiver<ControlRequest>>,
     pending_shots: Vec<(u64, Option<String>, std::sync::mpsc::Sender<Value>, f64)>,
     queued_shots: Vec<(u64, f64, u32)>,
@@ -231,6 +248,13 @@ impl CadApp {
             cmd: cmdline::CmdLine::default(),
             status: None,
             integrated_titlebar: false,
+            cloud: craft_ui::cloud::CloudFiles::new(),
+            share: craft_ui::share::ShareDialog::default(),
+            presence: craft_ui::presence::PresenceBar::default(),
+            cloud_page: None,
+            save_to_cloud: None,
+            cloud_sent: cloud::Sent::new(),
+            egui_ctx: None,
             control_rx: None,
             pending_shots: Vec::new(),
             queued_shots: Vec::new(),
@@ -483,6 +507,11 @@ impl CadApp {
     fn draw(&mut self, ui: &mut egui::Ui) {
         let t0 = now_ms();
         control::begin_frame(ui.ctx());
+        // Store the egui context for URL opening (share dialog, conversation link).
+        self.egui_ctx = Some(ui.ctx().clone());
+        // Drain the cloud event channel before layout so the frame that follows
+        // a completed read/write reflects its result immediately.
+        cloud::pump(self, ui.ctx());
         let t = theme::Tokens::get();
         chrome::title_and_toolbar(self, ui);
         if self.ui.in_window_menu {
@@ -502,6 +531,11 @@ impl CadApp {
                 chrome::start_page(self, ui);
             }
         });
+        // Cloud modal (Open from Cloud / Save to Cloud) over the canvas.
+        cloud::modal(self, ui.ctx());
+        // The share dialog and conflict resolution are drawn over everything.
+        self.share.show(ui.ctx());
+        cloud::conflict_modal(self, ui.ctx());
         dialogs::show(self, ui.ctx());
         palettes::patterns::prompt_picker(self, ui.ctx());
         closing::prompt(self, ui.ctx());
