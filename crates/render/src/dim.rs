@@ -39,6 +39,8 @@ pub struct DimGeometry {
     /// The font glyphs of `text_glyphs` (outline indices into it).
     pub text_runs: Vec<cadcraft_fonts::TextGlyph>,
     pub text_pos: Vec2,
+    /// The measured value (DXF group 42): a length, or the angle in radians.
+    pub measurement: f64,
     pub text_angle: f64,
     pub text_height: f64,
     /// Plain text of the dimension.
@@ -411,18 +413,59 @@ fn tol_height_code(st: &DimStyle) -> String {
     format!("{}x", format_decimal(f / 0.7, 4, 8, "."))
 }
 
+/// Apply measurement placeholders or append a dimension suffix, bounding the resulting UTF-8 text.
 fn post(template: &str, meas: &str) -> String {
-    if template.contains("<>") { template.replace("<>", meas) } else { format!("{meas}{template}") }
+    if template.contains("<>") {
+        bounded_replace(template, meas)
+    } else {
+        let mut out = String::new();
+        append_dim_text(&mut out, meas);
+        append_dim_text(&mut out, template);
+        out
+    }
 }
 
+/// Apply dimension text overrides: empty uses the base, whitespace suppresses text, and other text substitutes it.
 fn apply_override(base: &str, d: &Dimension) -> String {
     if d.text.is_empty() {
         base.to_string()
     } else if d.text.trim().is_empty() {
         String::new()
     } else {
-        d.text.replace("<>", base)
+        bounded_replace(&d.text, base)
     }
+}
+
+/// Largest dimension text produced by substituting the measurement into style/override text. Two
+/// modest strings can otherwise expand into gigabytes when the template holds many `<>` markers
+/// (CWE-789); past this the output is truncated rather than allocated unbounded.
+const MAX_DIM_TEXT: usize = 64 * 1024;
+
+/// Replace every `<>` in `template` with `value`, with the expanded length checked against
+/// [`MAX_DIM_TEXT`] before allocating so a many-placeholder template cannot blow up memory.
+fn bounded_replace(template: &str, value: &str) -> String {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(i) = rest.find("<>") {
+        if !append_dim_text(&mut out, &rest[..i]) || !append_dim_text(&mut out, value) {
+            return out;
+        }
+        rest = &rest[i + 2..];
+    }
+    append_dim_text(&mut out, rest);
+    out
+}
+
+// Returns false when truncation consumed the remaining UTF-8-safe space.
+/// Append within the remaining dimension-text byte allowance without splitting a UTF-8 character.
+/// Return false if any input text had to be truncated.
+fn append_dim_text(out: &mut String, text: &str) -> bool {
+    let mut end = text.len().min(MAX_DIM_TEXT.saturating_sub(out.len()));
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.push_str(&text[..end]);
+    end == text.len()
 }
 
 fn ext_line(origin: Vec2, foot: Vec2, st: &DimStyle, k: f64) -> Option<Vec<Vec2>> {
@@ -527,6 +570,7 @@ pub fn dimension_geometry_with(d: &Dimension, st: &DimStyle, dimscale: f64, font
             // The measurement is along the dimension direction whatever the extension lines do.
             let meas = (p2 - p1).dot(dir).abs();
             g.mtext = linear_text(meas, d, st, "");
+            g.measurement = meas;
             // From here on: the length drawn between the extension lines.
             let meas = f1.dist(f2);
             if !st.suppress_ext1 {
@@ -697,7 +741,7 @@ pub fn dimension_geometry_with(d: &Dimension, st: &DimStyle, dimscale: f64, font
                 }
             }
         }
-        DimKind::Radius if d.marks.jogged.is_some() => {
+        DimKind::Radius if d.marks.jogged.is_some() => 'jogged: {
             // DIMJOGGED: from the arrowhead on the arc toward the centre, a jog at DIMJOGANG,
             // then on to the overriding centre (parallel to the first part).
             let center = d.defpt.xy();
@@ -706,6 +750,10 @@ pub fn dimension_geometry_with(d: &Dimension, st: &DimStyle, dimscale: f64, font
             let j = d.marks.jogged.clone().unwrap_or_default();
             let (o, jp) = (j.center.xy(), j.jog.xy());
             g.mtext = linear_text(r, d, st, "R");
+            // A NaN or infinite radius leaves no line to draw (and NaN is no bound for `clamp`).
+            if !r.is_finite() {
+                break 'jogged;
+            }
             let (tw, _) = measure(&g.mtext);
             let u = (tip - center).normalized();
             let u = if u == Vec2::ZERO || !u.is_finite() { Vec2::X } else { u };
@@ -735,6 +783,7 @@ pub fn dimension_geometry_with(d: &Dimension, st: &DimStyle, dimscale: f64, font
             let (center, r) = if radius { (a, a.dist(b)) } else { (a.mid(b), a.dist(b) / 2.0) };
             let meas = if radius { r } else { 2.0 * r };
             g.mtext = linear_text(meas, d, st, if radius { "R" } else { "%%c" });
+            g.measurement = meas;
             let (tw, tht) = measure(&g.mtext);
             let u = (b - center).normalized();
             let u = if u == Vec2::ZERO || !u.is_finite() { Vec2::X } else { u };
@@ -769,7 +818,16 @@ pub fn dimension_geometry_with(d: &Dimension, st: &DimStyle, dimscale: f64, font
                         end(&mut g, blk1, start, -u);
                     }
                 }
-                g.dim(vec![tip, tpos]);
+                // Text the user placed: the leader stops short of it by the offset the default
+                // placement leaves between leader end and text.
+                let lead = if !d.user_text_pos {
+                    tpos
+                } else if horizontal {
+                    text_mid - Vec2::new(tw / 2.0 + gap, 0.0) * if u.x >= 0.0 { 1.0 } else { -1.0 }
+                } else {
+                    text_mid - u * (tw / 2.0 + gap)
+                };
+                g.dim(vec![tip, lead]);
             }
             end(&mut g, blk2, tip, u);
             if horizontal {
@@ -814,6 +872,7 @@ pub fn dimension_geometry_with(d: &Dimension, st: &DimStyle, dimscale: f64, font
             let arc =
                 if cadcraft_geom::angle_in_sweep(vertex.angle_to(arc_pt), s, e) { Arc::new(vertex, r, s, e) } else { Arc::new(vertex, r, e, s) };
             let sweep = ccw_sweep(arc.start, arc.end);
+            g.measurement = sweep;
             // DIMAZIN 1 / 2 suppress leading / trailing zeros (DIMZIN's bits 4 / 8).
             let azin = (st.angular_zero_suppression & 3) * 4;
             let txt = format_angle(sweep, st.angular_unit, st.angular_decimals, azin);
@@ -854,6 +913,7 @@ pub fn dimension_geometry_with(d: &Dimension, st: &DimStyle, dimscale: f64, font
             let origin = d.defpt.xy();
             let meas = if x_type { (feature.x - origin.x).abs() } else { (feature.y - origin.y).abs() };
             g.mtext = linear_text(meas, d, st, "");
+            g.measurement = meas;
             let (tw, _) = measure(&g.mtext);
             g.dim(vec![feature, leader_end]);
             if x_type {
@@ -872,6 +932,7 @@ pub fn dimension_geometry_with(d: &Dimension, st: &DimStyle, dimscale: f64, font
             let meas = r * arc.sweep();
             // DIMARCSYM: the arc symbol before the text (0), over it (1) or none (2).
             g.mtext = linear_text(meas, d, st, if st.arc_symbol == 0 { "⌒" } else { "" });
+            g.measurement = meas;
             let mut pts = Vec::new();
             arc.tessellate(arc.radius * 1e-3, &mut pts);
             g.dim(pts);
@@ -1006,6 +1067,7 @@ mod tests {
     fn horizontal_measures_dx() {
         let g = dimension_geometry(&lin((0.0, 0.0), (10.0, 3.0), (0.0, 5.0), 0.0), &DimStyle::default(), 1.0);
         assert_eq!(g.value, "10.0000");
+        assert_eq!(g.measurement, 10.0);
         assert!(!g.text.is_empty());
         assert_eq!(g.fills.len(), 2);
         assert_eq!(g.lines_of(LineRole::Ext).count(), 2);
@@ -1015,6 +1077,7 @@ mod tests {
     fn vertical_measures_dy() {
         let g = dimension_geometry(&lin((0.0, 0.0), (10.0, 3.0), (15.0, 0.0), std::f64::consts::FRAC_PI_2), &DimStyle::default(), 1.0);
         assert_eq!(g.value, "3.0000");
+        assert!((g.measurement - 3.0).abs() < 1e-12, "{}", g.measurement);
     }
 
     #[test]
@@ -1282,5 +1345,41 @@ mod tests {
         }
         let z = lin((0.0, 0.0), (0.0, 0.0), (0.0, 0.0), 0.0);
         let _ = dimension_geometry(&z, &DimStyle::default(), 1.0);
+    }
+
+    #[test]
+    fn jogged_radius_with_nan_radius_draws_no_lines() {
+        let mut d = lin((0.0, 0.0), (0.0, 0.0), (0.0, 0.0), 0.0);
+        d.kind = DimKind::Radius;
+        d.p15 = Vec3::new(10.0, 0.0, 0.0);
+        d.marks.jogged = Some(cadcraft_doc::JoggedRadius { center: Vec3::new(0.0, -4.0, 0.0), jog: Vec3::new(5.0, -2.0, 0.0) });
+        // Finite control: the jogged line runs from the arrowhead on the arc to the override centre.
+        let g = dimension_geometry(&d, &DimStyle::default(), 1.0);
+        let jog = g.lines.iter().find(|l| l.len() == 4).expect("jogged dimension line");
+        assert!(jog[0].near(Vec2::new(10.0, 0.0), 1e-9) && jog[3].near(Vec2::new(0.0, -4.0), 1e-9));
+        // A NaN in the tip makes the radius NaN: nothing usable to draw, and no panic.
+        d.p15 = Vec3::new(f64::NAN, 0.0, 0.0);
+        let g = dimension_geometry(&d, &DimStyle::default(), 1.0);
+        assert!(g.lines.is_empty() && g.fills.is_empty(), "{:?}", g.lines);
+    }
+}
+
+#[cfg(test)]
+mod text_budget_tests {
+    use super::*;
+    /// A dimension suffix without placeholders still obeys the total text limit.
+    #[test]
+    fn bounds_post_without_markers() {
+        let text = post(&"x".repeat(MAX_DIM_TEXT * 2), "12");
+        assert_eq!(text.len(), MAX_DIM_TEXT);
+        assert!(text.starts_with("12x"));
+    }
+    /// Oversized substituted text retains its prefix and ends at a valid UTF-8 boundary.
+    #[test]
+    fn oversized_value_is_substituted_and_truncated_at_a_character_boundary() {
+        let text = bounded_replace("prefix <> mm", &"é".repeat(MAX_DIM_TEXT));
+        assert!(text.starts_with("prefix é"));
+        assert!(!text.contains("<>"));
+        assert!(text.len() <= MAX_DIM_TEXT && text.len() >= MAX_DIM_TEXT - 1);
     }
 }

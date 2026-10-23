@@ -762,13 +762,16 @@ pub struct CursorQuery {
     pub base: Option<Vec2>,
     /// The prompt resolves deferred tangent/perpendicular snaps.
     pub deferred: bool,
+    /// The base is a window's first corner ([`crate::prompt::Prompt::corner`]): no ortho.
+    pub corner: bool,
     /// The object snap aperture in world units (APERTURE pixels at the view scale).
     pub aperture: f64,
     /// How close, in world units, the cursor slides onto a tracking path.
     pub tol: f64,
     /// Seconds on any steady clock (acquisition timing).
     pub now: f64,
-    /// Shift is held.
+    /// Shift is held: it overrides ortho for as long as it is held, and acquires tracking
+    /// points with POLARMODE bit 8.
     pub shift: bool,
 }
 
@@ -778,7 +781,10 @@ impl crate::Session {
     /// tracking, Extension, Parallel, Apparent Intersection), then ortho.
     pub fn snap_cursor(&mut self, raw: Vec2, q: &CursorQuery) -> CursorSnap {
         // Snap and grid spacing are the drawing's (SNAPUNIT/GRIDUNIT live in its header).
-        let s = self.drafting_settings();
+        let mut s = self.drafting_settings();
+        // Holding Shift overrides ortho while it is held: on when ORTHOMODE is off, off when it
+        // is on (ORTHOMODE itself is unchanged). Ortho on also turns polar tracking off.
+        s.orthomode ^= q.shift;
         let angbase = self.angle_settings().angbase;
         let Ok(st) = self.state() else { return CursorSnap { point: raw, ..Default::default() } };
         let (doc, space) = (st.doc.clone(), st.edit_space());
@@ -821,6 +827,7 @@ impl crate::Session {
         }
         if let Some(b) = q.base
             && s.orthomode
+            && !q.corner
         {
             p = super::iso::ortho(&self.settings, b, p);
         }

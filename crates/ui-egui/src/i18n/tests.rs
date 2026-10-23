@@ -39,7 +39,7 @@ fn catalog_is_valid_and_preserves_placeholders_and_ellipses() {
 /// to English for what they don't cover yet; their gaps are reported, not enforced, so adding a
 /// command doesn't require a row in every language.
 const REQUIRED: &[&str] = &["uk"];
-const REPORTED: &[&str] = &["pt-BR", "de", "es", "cs", "ru", "fr", "zh"];
+const REPORTED: &[&str] = &["pt-BR", "de", "es", "cs", "ru", "fr", "zh", "it", "ko", "sv", "ar", "hu", "tr", "el"];
 
 fn check(language: &str, what: &str, missing: Vec<String>) {
     if REQUIRED.contains(&language) {
@@ -96,8 +96,13 @@ fn missing_marked_ui_literals(language: &str) -> BTreeSet<String> {
         include_str!("../palettes/quickcalc.rs"),
         include_str!("../palettes/patterns.rs"),
         include_str!("../dialogs.rs"),
+        include_str!("../hatchdlg.rs"),
+        include_str!("../aliasdlg.rs"),
+        include_str!("../mtext_editor.rs"),
         include_str!("../layers.rs"),
         include_str!("../canvas/compare.rs"),
+        include_str!("../canvas/blockedit.rs"),
+        include_str!("../bedit.rs"),
         include_str!("../palettes.rs"),
         include_str!("../parametric.rs"),
         include_str!("../quick.rs"),
@@ -267,6 +272,36 @@ fn live_switch_to_brazilian_portuguese_translates_the_shell() {
     assert!(render(&mut app, &ctx).contains("Properties"));
 }
 
+#[test]
+fn the_wcs_pill_draws_its_arrow_instead_of_a_glyph_a_font_may_lack() {
+    // #1541: "WCS ⌄" showed a box where the UI font had no "⌄"; the chevron is now drawn as
+    // lines, so no catalog and no language paints the glyph.
+    for (name, catalog) in [
+        ("ar", include_str!("ar.tsv")),
+        ("cs", include_str!("cs.tsv")),
+        ("de", include_str!("de.tsv")),
+        ("es", include_str!("es.tsv")),
+        ("fr", include_str!("fr.tsv")),
+        ("it", include_str!("it.tsv")),
+        ("ko", include_str!("ko.tsv")),
+        ("pt_br", include_str!("pt_br.tsv")),
+        ("ru", include_str!("ru.tsv")),
+        ("sv", include_str!("sv.tsv")),
+        ("uk", include_str!("uk.tsv")),
+        ("zh", include_str!("zh.tsv")),
+    ] {
+        assert!(!catalog.contains('\u{2304}'), "{name}.tsv still has the \u{2304} glyph");
+    }
+    let ctx = egui::Context::default();
+    let mut app = CadApp::new(Session::new(), Services::default());
+    for (lang, label) in [("en", "WCS"), ("de", "WKS"), ("ru", "МСК")] {
+        app.run("ui.language", json!({ "lang": lang })).unwrap();
+        let text = render(&mut app, &ctx);
+        assert!(text.lines().any(|l| l == label), "{lang}: the pill reads {label}");
+        assert!(!text.contains('\u{2304}'), "{lang}: no \u{2304} glyph is painted");
+    }
+}
+
 fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> String {
     fn collect(shape: &egui::Shape, text: &mut String) {
         match shape {
@@ -348,6 +383,7 @@ fn dialogs_render_in_ukrainian_and_keep_their_source_ids() {
         ("qselect", "Швидкий вибір"),
         ("parameters", "Диспетчер параметрів"),
         ("language", "Мова інтерфейсу"),
+        ("hatch", "Штрихування та градієнт"),
     ] {
         let mut app = CadApp::new(Session::new(), Services::default());
         app.ui.interface_language = Preference::Ukrainian;
@@ -366,6 +402,22 @@ fn default_fonts_cover_every_german_special_letter_in_the_catalog() {
     let mut output = ctx.run_ui(Default::default(), |_| {});
     output.textures_delta.clear();
     let letters: BTreeSet<_> = include_str!("de.tsv").chars().filter(|c| ('\u{00c0}'..='\u{00ff}').contains(c)).collect();
+    ctx.fonts_mut(|view| {
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            let mut font = view.fonts.font(&family);
+            for c in &letters {
+                assert!(font.characters().contains_key(c), "missing {c} in {family:?}");
+            }
+        }
+    });
+}
+
+#[test]
+fn default_fonts_cover_every_brazilian_portuguese_letter_in_the_catalog() {
+    let ctx = egui::Context::default();
+    let mut output = ctx.run_ui(Default::default(), |_| {});
+    output.textures_delta.clear();
+    let letters: BTreeSet<_> = include_str!("pt_br.tsv").chars().filter(|c| ('\u{00c0}'..='\u{00ff}').contains(c)).collect();
     ctx.fonts_mut(|view| {
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
             let mut font = view.fonts.font(&family);
@@ -525,19 +577,598 @@ fn russian_and_french_plurals() {
     });
 }
 
-/// Chinese shows only with an installed CJK font (none is bundled); without one the interface
-/// stays English instead of drawing boxes, and choosing it says why.
 #[test]
-fn chinese_needs_an_installed_cjk_font() {
+fn italian_locales_plurals_and_accents() {
+    for tag in ["it", "it-IT", "it_IT.UTF-8", "IT-ch", " it-CH ", "it_IT@euro"] {
+        assert_eq!(locale_language(tag), Some("it"), "{tag}");
+    }
+    assert_eq!(locale_language("italic"), None);
+    assert_eq!(Preference::parse("it"), Some(Preference::Italian));
+    assert_eq!(Preference::Auto.resolve(&["it-IT".into(), "en-US".into()]), "it");
+    assert_eq!(Preference::Italian.resolve(&["uk-UA".into()]), "it");
+    with_language("it", || {
+        for (n, word) in [(0, "collaboratori"), (1, "collaboratore"), (2, "collaboratori"), (21, "collaboratori")] {
+            assert_eq!(count(n, "{n} contributor", "{n} contributors"), format!("{n} {word}"));
+        }
+        assert_eq!(t("Draw"), "Disegna");
+        assert_eq!(tr_menu("it", "Modify"), "Edita");
+        assert_eq!(tr("it", "Modify"), "Modifica");
+        assert_eq!(tr_menu("it", "View"), "Visualizza");
+        assert_eq!(tr("it", "View"), "Vista");
+    });
+    // Italian accented letters (à è é ì ò ù and capitals) come from the bundled egui fonts.
+    let ctx = egui::Context::default();
+    let mut output = ctx.run_ui(Default::default(), |_| {});
+    output.textures_delta.clear();
+    let letters: BTreeSet<_> = include_str!("it.tsv").chars().filter(|c| ('\u{00c0}'..='\u{00ff}').contains(c)).collect();
+    assert!(letters.contains(&'à') && letters.contains(&'è'));
+    ctx.fonts_mut(|view| {
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            let mut font = view.fonts.font(&family);
+            for c in &letters {
+                assert!(font.characters().contains_key(c), "missing {c} in {family:?}");
+            }
+        }
+    });
+}
+
+/// Chinese shows only with a font for it: an installed CJK font, or one this build embedded from
+/// craft-fonts (the web build has no system fonts). Without either the interface stays English
+/// instead of drawing boxes, and choosing it says why.
+#[test]
+fn chinese_needs_a_cjk_font() {
     assert_eq!(locale_language("zh-CN"), Some("zh"));
     let mut app = CadApp::new(Session::new(), Services::default());
     let r = app.run("ui.language", json!({"lang": "zh"})).unwrap();
     assert_eq!(r["interfaceLanguage"], "zh");
-    let font = crate::theme::cjk_font();
-    assert_eq!(app.language(), if font.is_some() { "zh" } else { "en" });
+    let shown = crate::theme::can_show("zh");
+    assert_eq!(app.language(), if shown { "zh" } else { "en" });
     assert_eq!(r["shown"], app.language());
     assert!(crate::theme::can_show("uk") && crate::theme::can_show("en"));
-    if font.is_none() {
+    if !shown {
         assert!(app.status.as_ref().is_some_and(|(s, _)| s.contains("No Chinese font")));
     }
+}
+
+#[test]
+fn hatch_dialog_extents_label_says_extents_in_ukrainian() {
+    assert_eq!(tr("uk", "Default to boundary extents"), "Типово за габаритами контуру");
+}
+
+#[test]
+fn korean_representative_translations_remain_available() {
+    let ko = catalog("ko").unwrap();
+    // Fixed regression examples; new source strings remain reported, not required for Korean.
+    assert!(REPORTED.contains(&"ko"));
+    for (context, source, expected) in [
+        ("", "File", "파일"),
+        ("menu", "View", "보기"),
+        ("menu", "Draw", "그리기"),
+        ("menu", "Dimension", "치수"),
+        ("menu", "Modify", "수정"),
+        ("", "Options...", "옵션..."),
+        ("", "User Preferences", "사용자 기본 설정"),
+        ("", "Interface Language", "인터페이스 언어"),
+        ("", "Properties", "특성"),
+        ("", "Degree", "도 기호"),
+        ("", "Style: Standard", "스타일: Standard"),
+        ("", "WCS", "WCS"),
+        ("@plural", "{n} contributor", "기여자 {n}명"),
+        ("@plural", "{n} commit", "커밋 {n}개"),
+    ] {
+        assert_eq!(ko.get(&(context, source)).copied(), Some(expected), "{context}: {source}");
+    }
+    assert_eq!(tr("ko", "future untranslated label"), "future untranslated label");
+}
+
+#[test]
+fn korean_locale_saved_preference_and_single_count_form() {
+    for tag in ["ko", "ko-KR", "ko_KR.UTF-8", "KO-kr", " ko-KR ", "ko_KR@euro"] {
+        assert_eq!(locale_language(tag), Some("ko"), "{tag}");
+    }
+    for tag in ["kr", "korean", "kotlin"] {
+        assert_eq!(locale_language(tag), None, "{tag}");
+    }
+    assert_eq!(Preference::parse("ko"), Some(Preference::Korean));
+    assert_eq!(Preference::Korean.resolve(&["en-US".into()]), "ko");
+    assert_eq!(Preference::Auto.resolve(&["pl-PL".into(), "ko-KR".into(), "en-US".into()]), "ko");
+    let mut app = CadApp::new(Session::new(), Services::default());
+    app.system_languages = vec!["ko-KR".into()];
+    app.run("ui.language", json!({"lang": "ko"})).unwrap();
+    let mut restored = CadApp::new(Session::new(), Services::default());
+    restored.system_languages = vec!["en-US".into()];
+    restored.load_prefs(&app.prefs_json());
+    assert_eq!(restored.ui.interface_language, Preference::Korean);
+    assert_eq!(restored.language(), app.language());
+    with_language("ko", || {
+        for n in [0, 1, 2, 5, 11, 21, 101, u64::MAX] {
+            assert_eq!(plural_ko(n), 0);
+            assert_eq!(count(n, "{n} contributor", "{n} contributors"), format!("기여자 {n}명"));
+        }
+        assert_eq!(format("Current: {color}", &[("color", "{n} Open".into())]), "현재: {n} Open");
+    });
+}
+
+#[test]
+fn korean_live_switch_keeps_automation_and_drawing_and_falls_back_without_font() {
+    let mut app = CadApp::new(Session::new(), Services::default());
+    app.ui.in_window_menu = true;
+    app.session.state_mut().unwrap().title = "Open".into();
+    let ctx = egui::Context::default();
+    app.logic(&ctx);
+    assert!(render(&mut app, &ctx).contains("Properties"));
+    app.start("line");
+    let prompt = crate::control::cmdline_state(&app);
+    let commands = crate::control::all_commands(&app);
+    let result = app.run("ui.language", json!({"lang": "ko"})).unwrap();
+    let supported = crate::theme::can_show("ko");
+    assert_eq!(result["shown"], if supported { "ko" } else { "en" });
+    assert_eq!(app.ui.interface_language, Preference::Korean);
+    app.logic(&ctx);
+    assert_eq!(app.fonts_language, Some(app.language()));
+    let text = render(&mut app, &ctx);
+    if supported {
+        for label in ["특성", "파일", "첫 번째 점 지정"] {
+            assert!(text.contains(label), "missing {label}: {text}");
+        }
+    } else {
+        assert!(text.contains("Properties"));
+        assert!(app.status.as_ref().is_some_and(|(s, _)| s.contains("No font covers the Korean interface")));
+        assert_eq!(Preference::Korean.name(), "Korean");
+    }
+    assert_eq!(app.session.state().unwrap().title, "Open");
+    assert_eq!(crate::control::cmdline_state(&app), prompt);
+    assert_eq!(crate::control::all_commands(&app), commands);
+    assert_eq!(t("Properties"), "Properties");
+    assert!(app.run("ui.language", json!({"lang": "bad"})).is_err());
+    app.run("ui.resetpalettes", json!({})).unwrap();
+    assert_eq!(app.ui.interface_language, Preference::Korean);
+    // The general ui.set route uses the same saved preference and font installation.
+    let (request, _) = crate::ControlRequest::new("ui.set", json!({"interfaceLanguage": "zh"}));
+    let _ = crate::control::handle(&mut app, &ctx, &request);
+    assert_eq!(app.ui.interface_language, Preference::Chinese);
+    app.logic(&ctx);
+    assert_eq!(app.fonts_language, Some(if crate::theme::can_show("zh") { "zh" } else { "en" }));
+    render(&mut app, &ctx);
+    let (request, _) = crate::ControlRequest::new("ui.set", json!({"interfaceLanguage": "ko"}));
+    let _ = crate::control::handle(&mut app, &ctx, &request);
+    assert_eq!(app.ui.interface_language, Preference::Korean);
+    app.logic(&ctx);
+    assert_eq!(app.fonts_language, Some(app.language()));
+    let text = render(&mut app, &ctx);
+    assert!(text.contains(if supported { "특성" } else { "Properties" }));
+    let (request, _) = crate::ControlRequest::new("ui.set", json!({"interfaceLanguage": "en"}));
+    let _ = crate::control::handle(&mut app, &ctx, &request);
+    app.logic(&ctx);
+    assert_eq!(app.fonts_language, Some("en"));
+    assert_eq!(app.ui.interface_language, Preference::English);
+    assert!(render(&mut app, &ctx).contains("Properties"));
+    assert_eq!(crate::menus::tree(&app).first().unwrap().0, "File");
+}
+
+#[test]
+fn korean_dialogs_keep_source_ids() {
+    if !crate::theme::can_show("ko") {
+        return; // The fallback path is covered above; do not claim glyph rendering here.
+    }
+    for (dialog, source) in [
+        ("dsettings", "Drafting Settings"),
+        ("about", "About CADCraft"),
+        ("commands", "Command Reference"),
+        ("blocks", "Blocks"),
+        ("layers", "Layer Properties Manager"),
+        ("qselect", "Quick Select"),
+        ("parameters", "Parameters Manager"),
+        ("language", "Interface Language"),
+        ("options:preferences", "User Preferences"),
+    ] {
+        let mut app = CadApp::new(Session::new(), Services::default());
+        app.ui.interface_language = Preference::Korean;
+        app.ui.dialog = Some(dialog.into());
+        let ctx = egui::Context::default();
+        app.logic(&ctx);
+        let text = render(&mut app, &ctx);
+        assert!(text.contains(tr("ko", source)), "{dialog}: {text}");
+        if dialog == "language" {
+            assert!(text.contains("한국어"), "{dialog}: {text}");
+        }
+        assert_eq!(app.ui.dialog.as_deref(), Some(dialog));
+    }
+}
+
+#[test]
+fn korean_ui_fonts_cover_catalog_and_language_picker_in_both_families() {
+    if !crate::theme::can_show("ko") {
+        return;
+    }
+    let letters: BTreeSet<_> = include_str!("ko.tsv")
+        .lines()
+        .filter_map(|line| line.split('\t').nth(2))
+        .flat_map(str::chars)
+        .chain("한국어".chars())
+        .filter(|c| !c.is_ascii())
+        .collect();
+    // The picker shows 한국어 in an English interface only when the CJK fonts loaded in every
+    // language cover Hangul; the Korean interface itself always does, with a fallback font.
+    let ctx = egui::Context::default();
+    let english = crate::theme::cjk_covers_hangul();
+    assert_eq!(with_language("en", || Preference::Korean.name()), if english { "한국어" } else { "Korean" });
+    assert_eq!(with_language("ko", || Preference::Korean.name()), "한국어");
+    crate::theme::install_fonts(&ctx, if english { "en" } else { "ko" });
+    let mut output = ctx.run_ui(Default::default(), |_| {});
+    output.textures_delta.clear();
+    let missing = ctx.fonts_mut(|view| {
+        let mut missing = Vec::new();
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            let mut font = view.fonts.font(&family);
+            for c in &letters {
+                if !font.characters().contains_key(c) {
+                    missing.push(format!("{family:?}: {c} (U+{:04X})", u32::from(*c)));
+                }
+            }
+        }
+        missing
+    });
+    assert!(missing.is_empty(), "missing Korean UI glyphs: {}", missing.join(", "));
+}
+
+#[test]
+fn swedish_locales_preferences_and_plural_forms() {
+    for tag in ["sv", "sv-SE", "sv_SE.UTF-8", "SV-se", " sv-SE ", "sv-FI"] {
+        assert_eq!(locale_language(tag), Some("sv"), "{tag}");
+    }
+    // `se` is Northern Sami and `swe` the three-letter code; neither picks Swedish.
+    for tag in ["se", "swe", "svenska"] {
+        assert_eq!(locale_language(tag), None, "{tag}");
+    }
+    assert_eq!(Preference::parse("sv"), Some(Preference::Swedish));
+    assert_eq!(Preference::Swedish.name(), "Svenska");
+    assert_eq!(Preference::Swedish.resolve(&["en-US".into()]), "sv");
+    assert_eq!(Preference::Auto.resolve(&["pl-PL".into(), "sv-SE".into(), "en-US".into()]), "sv");
+    let mut app = CadApp::new(Session::new(), Services::default());
+    app.ui.interface_language = Preference::Swedish;
+    let mut restored = CadApp::new(Session::new(), Services::default());
+    restored.load_prefs(&app.prefs_json());
+    assert_eq!(restored.ui.interface_language, Preference::Swedish);
+    with_language("sv", || {
+        for n in [0, 1, 2, 5, 21, u64::MAX] {
+            // `bidragsgivare` is the same in the singular and the plural; `commit` takes an -s.
+            assert_eq!(count(n, "{n} contributor", "{n} contributors"), format!("{n} bidragsgivare"));
+            let commit = if n == 1 { "commit" } else { "commits" };
+            assert_eq!(count(n, "{n} commit", "{n} commits"), format!("{n} {commit}"));
+        }
+        assert_eq!(format("Current: {color}", &[("color", "{n} Open".into())]), "Aktuell: {n} Open");
+    });
+}
+
+#[test]
+fn swedish_menu_headings_keep_object_labels() {
+    with_language("sv", || {
+        assert_eq!(menu("Dimension"), "Måttsättning");
+        assert_eq!(t("Dimension"), "Mått");
+        assert_eq!(menu("View"), "Visa");
+        assert_eq!(menu("Draw"), "Rita");
+        assert_eq!(menu("Modify"), "Ändra");
+        assert_eq!(menu("Edit"), "Redigera");
+        assert_eq!(menu("File"), "Arkiv");
+    });
+}
+
+#[test]
+fn live_swedish_switch_preserves_drawing_command_and_saved_choice() {
+    let mut app = CadApp::new(Session::new(), Services::default());
+    app.ui.in_window_menu = true;
+    app.session.state_mut().unwrap().title = "Open".into();
+    let ctx = egui::Context::default();
+    app.logic(&ctx);
+    assert!(render(&mut app, &ctx).contains("Properties"));
+    app.start("line");
+    let prompt = crate::control::cmdline_state(&app);
+    let commands = crate::control::all_commands(&app);
+    app.run("ui.language", json!({"lang":"sv"})).unwrap();
+    let text = render(&mut app, &ctx);
+    for label in ["Egenskaper", "Arkiv", "Visa", "Rita", "Måttsättning", "Ange första punkten"] {
+        assert!(text.contains(label), "missing {label}: {text}");
+    }
+    assert_eq!(app.language(), "sv");
+    assert_eq!(app.session.state().unwrap().title, "Open");
+    assert_eq!(crate::control::cmdline_state(&app), prompt);
+    assert_eq!(crate::control::all_commands(&app), commands);
+    app.run("ui.language", json!({"lang":"en"})).unwrap();
+    assert!(render(&mut app, &ctx).contains("Properties"));
+}
+
+#[test]
+fn swedish_dialogs_render_with_stable_ids() {
+    for (dialog, heading) in [
+        ("dsettings", "Ritinställningar"),
+        ("about", "Om CADCraft"),
+        ("blocks", "Block"),
+        ("layers", "Hantera lageregenskaper"),
+        ("qselect", "Snabbmarkering"),
+        ("parameters", "Hantera parametrar"),
+        ("language", "Svenska"),
+        ("options:preferences", "Användarinställningar"),
+    ] {
+        let mut app = CadApp::new(Session::new(), Services::default());
+        app.ui.interface_language = Preference::Swedish;
+        app.ui.dialog = Some(dialog.into());
+        let ctx = egui::Context::default();
+        app.logic(&ctx);
+        let text = render(&mut app, &ctx);
+        assert!(text.contains(heading), "{dialog}: {text}");
+        assert_eq!(app.ui.dialog.as_deref(), Some(dialog));
+    }
+}
+
+#[test]
+fn default_fonts_cover_swedish_letters_and_quotes() {
+    let ctx = egui::Context::default();
+    let mut output = ctx.run_ui(Default::default(), |_| {});
+    output.textures_delta.clear();
+    let letters: BTreeSet<_> = "ÅÄÖÉåäöé”–".chars().collect();
+    ctx.fonts_mut(|view| {
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            let mut font = view.fonts.font(&family);
+            for c in &letters {
+                assert!(font.characters().contains_key(c), "missing {c} in {family:?}");
+            }
+        }
+    });
+}
+
+#[test]
+fn hungarian_locales_preferences_and_plural_forms() {
+    for tag in ["hu", "hu-HU", "hu_HU.UTF-8", "HU-hu", " hu-HU "] {
+        assert_eq!(locale_language(tag), Some("hu"), "{tag}");
+    }
+    // `hun` is the three-letter code; neither it nor the endonym picks Hungarian.
+    for tag in ["hun", "magyar"] {
+        assert_eq!(locale_language(tag), None, "{tag}");
+    }
+    assert_eq!(Preference::parse("hu"), Some(Preference::Hungarian));
+    assert_eq!(Preference::Hungarian.name(), "Magyar");
+    assert_eq!(Preference::Hungarian.resolve(&["en-US".into()]), "hu");
+    assert_eq!(Preference::Auto.resolve(&["pl-PL".into(), "hu-HU".into(), "en-US".into()]), "hu");
+    let mut app = CadApp::new(Session::new(), Services::default());
+    app.ui.interface_language = Preference::Hungarian;
+    let mut restored = CadApp::new(Session::new(), Services::default());
+    restored.load_prefs(&app.prefs_json());
+    assert_eq!(restored.ui.interface_language, Preference::Hungarian);
+    with_language("hu", || {
+        for n in [0, 1, 2, 5, 21, u64::MAX] {
+            // A numeral takes the singular noun, so every count has the same form.
+            assert_eq!(count(n, "{n} contributor", "{n} contributors"), format!("{n} közreműködő"));
+            assert_eq!(count(n, "{n} commit", "{n} commits"), format!("{n} commit"));
+        }
+        assert_eq!(format("Current: {color}", &[("color", "{n} Open".into())]), "Aktuális: {n} Open");
+    });
+}
+
+#[test]
+fn hungarian_menu_headings_keep_object_labels() {
+    with_language("hu", || {
+        assert_eq!(menu("Dimension"), "Méretezés");
+        assert_eq!(t("Dimension"), "Méret");
+        assert_eq!(menu("View"), "Nézet");
+        assert_eq!(menu("Draw"), "Rajzolás");
+        assert_eq!(menu("Modify"), "Módosítás");
+        assert_eq!(menu("Edit"), "Szerkesztés");
+        assert_eq!(menu("File"), "Fájl");
+    });
+}
+
+#[test]
+fn live_hungarian_switch_preserves_drawing_command_and_saved_choice() {
+    let mut app = CadApp::new(Session::new(), Services::default());
+    app.ui.in_window_menu = true;
+    app.session.state_mut().unwrap().title = "Open".into();
+    let ctx = egui::Context::default();
+    app.logic(&ctx);
+    assert!(render(&mut app, &ctx).contains("Properties"));
+    app.start("line");
+    let prompt = crate::control::cmdline_state(&app);
+    let commands = crate::control::all_commands(&app);
+    app.run("ui.language", json!({"lang":"hu"})).unwrap();
+    let text = render(&mut app, &ctx);
+    for label in ["Tulajdonságok", "Fájl", "Nézet", "Rajzolás", "Méretezés", "Add meg az első pontot"] {
+        assert!(text.contains(label), "missing {label}: {text}");
+    }
+    assert_eq!(app.language(), "hu");
+    assert_eq!(app.session.state().unwrap().title, "Open");
+    assert_eq!(crate::control::cmdline_state(&app), prompt);
+    assert_eq!(crate::control::all_commands(&app), commands);
+    app.run("ui.language", json!({"lang":"en"})).unwrap();
+    assert!(render(&mut app, &ctx).contains("Properties"));
+}
+
+#[test]
+fn hungarian_dialogs_render_with_stable_ids() {
+    for (dialog, heading) in [
+        ("dsettings", "Rajzolási beállítások"),
+        ("about", "A CADCraft névjegye"),
+        ("blocks", "Blokk"),
+        ("layers", "Rétegtulajdonság-kezelő"),
+        ("qselect", "Gyorskijelölés"),
+        ("parameters", "Paraméterkezelő"),
+        ("language", "Magyar"),
+        ("options:preferences", "Felhasználói beállítások"),
+    ] {
+        let mut app = CadApp::new(Session::new(), Services::default());
+        app.ui.interface_language = Preference::Hungarian;
+        app.ui.dialog = Some(dialog.into());
+        let ctx = egui::Context::default();
+        app.logic(&ctx);
+        let text = render(&mut app, &ctx);
+        assert!(text.contains(heading), "{dialog}: {text}");
+        assert_eq!(app.ui.dialog.as_deref(), Some(dialog));
+    }
+}
+
+#[test]
+fn default_fonts_cover_hungarian_letters_and_quotes() {
+    let ctx = egui::Context::default();
+    let mut output = ctx.run_ui(Default::default(), |_| {});
+    output.textures_delta.clear();
+    // Ő ő Ű ű (double acute) are in Latin Extended-A, outside the ranges the other tests check.
+    let letters: BTreeSet<_> = "ÁÉÍÓÖŐÚÜŰáéíóöőúüű„”–…".chars().collect();
+    ctx.fonts_mut(|view| {
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            let mut font = view.fonts.font(&family);
+            for c in &letters {
+                assert!(font.characters().contains_key(c), "missing {c} in {family:?}");
+            }
+        }
+    });
+}
+
+#[test]
+fn turkish_locales_preferences_and_single_count_form() {
+    for tag in ["tr", "tr-TR", "tr_TR.UTF-8", "TR-tr", " tr-TR ", "tr-CY"] {
+        assert_eq!(locale_language(tag), Some("tr"), "{tag}");
+    }
+    for tag in ["tur", "türkçe"] {
+        assert_eq!(locale_language(tag), None, "{tag}");
+    }
+    assert_eq!(Preference::parse("tr"), Some(Preference::Turkish));
+    assert_eq!(Preference::Turkish.name(), "Türkçe");
+    assert_eq!(Preference::Turkish.resolve(&["en-US".into()]), "tr");
+    assert_eq!(Preference::Auto.resolve(&["pl-PL".into(), "tr-TR".into(), "en-US".into()]), "tr");
+    let mut app = CadApp::new(Session::new(), Services::default());
+    app.ui.interface_language = Preference::Turkish;
+    let mut restored = CadApp::new(Session::new(), Services::default());
+    restored.load_prefs(&app.prefs_json());
+    assert_eq!(restored.ui.interface_language, Preference::Turkish);
+    with_language("tr", || {
+        // A Turkish noun stays singular after a number, 1 included.
+        for n in [0, 1, 2, 5, 21, u64::MAX] {
+            assert_eq!(count(n, "{n} contributor", "{n} contributors"), format!("{n} katkıda bulunan"));
+            assert_eq!(count(n, "{n} commit", "{n} commits"), format!("{n} commit"));
+        }
+        assert_eq!(format("Current: {color}", &[("color", "{n} Open".into())]), "Geçerli: {n} Open");
+    });
+}
+
+#[test]
+fn turkish_menu_headings_keep_object_labels_and_prompt_keywords() {
+    with_language("tr", || {
+        assert_eq!(menu("Dimension"), "Ölçülendirme");
+        assert_eq!(t("Dimension"), "Ölçü");
+        assert_eq!(menu("View"), "Görünüm");
+        assert_eq!(menu("Draw"), "Çiz");
+        assert_eq!(menu("Modify"), "Değiştir");
+        assert_eq!(menu("Edit"), "Düzenle");
+        assert_eq!(menu("File"), "Dosya");
+        // Clickable keywords keep the spelling the engine accepts.
+        assert_eq!(t("Enter Top, Zero or Bottom."), "Top, Zero veya Bottom girin.");
+        assert_eq!(t("Specify first point on circle: _tan to"), "Daire üzerindeki ilk noktayı belirtin: _tan to");
+    });
+}
+
+#[test]
+fn live_turkish_switch_preserves_drawing_command_and_saved_choice() {
+    let mut app = CadApp::new(Session::new(), Services::default());
+    app.ui.in_window_menu = true;
+    app.session.state_mut().unwrap().title = "Open".into();
+    let ctx = egui::Context::default();
+    app.logic(&ctx);
+    assert!(render(&mut app, &ctx).contains("Properties"));
+    app.start("line");
+    let prompt = crate::control::cmdline_state(&app);
+    let commands = crate::control::all_commands(&app);
+    app.run("ui.language", json!({"lang":"tr"})).unwrap();
+    let text = render(&mut app, &ctx);
+    for label in ["Özellikler", "Dosya", "Görünüm", "Çiz", "Ölçülendirme", "İlk noktayı belirtin"] {
+        assert!(text.contains(label), "missing {label}: {text}");
+    }
+    assert_eq!(app.language(), "tr");
+    assert_eq!(app.session.state().unwrap().title, "Open");
+    assert_eq!(crate::control::cmdline_state(&app), prompt);
+    assert_eq!(crate::control::all_commands(&app), commands);
+    app.run("ui.language", json!({"lang":"en"})).unwrap();
+    assert!(render(&mut app, &ctx).contains("Properties"));
+}
+
+#[test]
+fn turkish_dialogs_render_with_stable_ids() {
+    for (dialog, heading) in [
+        ("dsettings", "Çizim Ayarları"),
+        ("about", "CADCraft Hakkında"),
+        ("blocks", "Bloklar"),
+        ("layers", "Katman Özellikleri Yöneticisi"),
+        ("qselect", "Hızlı Seçim"),
+        ("parameters", "Parametre Yöneticisi"),
+        ("language", "Türkçe"),
+        ("options:preferences", "Kullanıcı Tercihleri"),
+    ] {
+        let mut app = CadApp::new(Session::new(), Services::default());
+        app.ui.interface_language = Preference::Turkish;
+        app.ui.dialog = Some(dialog.into());
+        let ctx = egui::Context::default();
+        app.logic(&ctx);
+        let text = render(&mut app, &ctx);
+        assert!(text.contains(heading), "{dialog}: {text}");
+        assert_eq!(app.ui.dialog.as_deref(), Some(dialog));
+    }
+}
+
+#[test]
+fn default_fonts_cover_every_turkish_letter_in_the_catalog() {
+    let ctx = egui::Context::default();
+    let mut output = ctx.run_ui(Default::default(), |_| {});
+    output.textures_delta.clear();
+    let mut letters: BTreeSet<_> = "ÇĞİÖŞÜçğıöşü".chars().collect();
+    let translations = include_str!("tr.tsv").lines().filter(|l| !l.starts_with('#')).filter_map(|l| l.rsplit('\t').next());
+    letters.extend(translations.flat_map(str::chars).filter(|c| !c.is_ascii() && c.is_alphabetic()));
+    ctx.fonts_mut(|view| {
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            let mut font = view.fonts.font(&family);
+            for c in &letters {
+                assert!(font.characters().contains_key(c), "missing {c} in {family:?}");
+            }
+        }
+    });
+}
+
+#[test]
+fn greek_catalog_locale_preferences_and_contexts() {
+    assert_eq!(Preference::parse("el"), Some(Preference::Greek));
+    assert_eq!(Preference::Greek.code(), "el");
+    assert_eq!(Preference::Greek.name(), "Ελληνικά");
+    for locale in ["el", "el-GR", "el_GR.UTF-8", "EL-cy"] {
+        assert_eq!(locale_language(locale), Some("el"));
+    }
+    assert_eq!(locale_language("elvish"), None);
+    assert_eq!(Preference::Greek.resolve(&["en-US".into()]), "el");
+    let saved = serde_json::to_string(&Preference::Greek).unwrap();
+    assert_eq!(saved, "\"el\"");
+    assert_eq!(serde_json::from_str::<Preference>(&saved).unwrap(), Preference::Greek);
+    assert_eq!(tr("el", "Layer"), "Επίπεδο (Layer)");
+    assert_eq!(tr_menu("el", "Dimension"), "Διαστασιολόγηση");
+    assert_eq!(tr("el", "Dimension"), "Διαστασιολόγηση (Dimension)");
+    with_language("el", || {
+        assert_eq!(t("Open"), "Άνοιγμα");
+        assert_eq!(count(1, "{n} contributor", "{n} contributors"), "1 συνεισφέρων");
+        assert_eq!(count(0, "{n} contributor", "{n} contributors"), "0 συνεισφέροντες");
+        assert_eq!(count(2, "{n} contributor", "{n} contributors"), "2 συνεισφέροντες");
+        assert_eq!(count(21, "{n} contributor", "{n} contributors"), "21 συνεισφέροντες");
+    });
+    assert_eq!(t("Open"), "Open", "language must not leak outside a render scope");
+}
+
+#[test]
+fn default_fonts_cover_all_greek_letters_in_the_catalog() {
+    let ctx = egui::Context::default();
+    let mut output = ctx.run_ui(Default::default(), |_| {});
+    output.textures_delta.clear();
+    let letters: BTreeSet<_> =
+        include_str!("el.tsv").chars().filter(|c| ('\u{0370}'..='\u{03ff}').contains(c) || ('\u{1f00}'..='\u{1fff}').contains(c)).collect();
+    ctx.fonts_mut(|view| {
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            let mut font = view.fonts.font(&family);
+            for c in &letters {
+                assert!(font.characters().contains_key(c), "missing Greek glyph {c} in {family:?}");
+            }
+        }
+    });
 }

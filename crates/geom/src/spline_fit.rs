@@ -96,6 +96,11 @@ impl FitOptions {
 /// systems the size of the point count several times.
 const MAX_APPROX_POINTS: usize = 300;
 
+/// Fit points above this count are not interpolated: interpolation solves a dense system the size
+/// of the point count squared (twice, about 270 MB at this size), so more points use them as
+/// control points instead. Above the 4,001 fit points of a 500-turn helix.
+const MAX_INTERP_POINTS: usize = 4_096;
+
 impl Spline {
     /// Build a spline through (or, with a tolerance, near) `fit`, open or closed. Closed curves
     /// are periodic and ignore end tangents; a tolerance approximates them with fewer periodic
@@ -167,8 +172,21 @@ impl Spline {
                         return true;
                     }
                 }
-                // Other writers use the parameters themselves as interior knots.
-                u.len() > 2 && u.iter().skip(1).take(u.len() - 2).all(|q| norm.iter().any(|k| close(*k, *q)))
+                // Other writers use the parameters themselves as interior knots. Both `u` and
+                // `norm` are ascending, so a single linear merge decides containment instead of
+                // re-scanning `norm` from the start for every parameter, which is quadratic on an
+                // otherwise valid spline (CWE-407).
+                if u.len() <= 2 {
+                    return false;
+                }
+                let interior = u.get(1..u.len() - 1).unwrap_or(&[]);
+                let mut j = 0usize;
+                interior.iter().all(|q| {
+                    while j < norm.len() && norm[j] < *q && !close(norm[j], *q) {
+                        j += 1;
+                    }
+                    norm.get(j).is_some_and(|k| close(*k, *q))
+                })
             })
             .unwrap_or(KnotParam::Chord)
     }
@@ -230,11 +248,15 @@ fn open_fit(fit: &[Vec2], opts: FitOptions) -> Spline {
     {
         return s;
     }
-    interpolate(fit, &u, d0, d1).unwrap_or_else(|| {
+    let through_control = || {
         let mut s = Spline::from_control(fit.to_vec(), 3.min(n - 1));
         s.fit = fit.to_vec();
         s
-    })
+    };
+    if n > MAX_INTERP_POINTS {
+        return through_control();
+    }
+    interpolate(fit, &u, d0, d1).unwrap_or_else(through_control)
 }
 
 /// Global interpolation: one control point per fit point plus one per end-derivative
@@ -613,7 +635,8 @@ fn closed_fit(fit: &[Vec2], kind: KnotParam, tol: f64) -> Spline {
         s
     };
     let p = 3;
-    if n < p {
+    // The open fallback runs through n + 1 points, so above the cap it does not interpolate.
+    if n < p || n > MAX_INTERP_POINTS {
         return fallback(&pts);
     }
     // Parameters t_0 = 0 .. t_n = 1 (t_n is the return to the first point).
@@ -854,11 +877,48 @@ mod tests {
         let _ = Spline::fit_with(&tight, true, FitOptions { tolerance: 1.0, ..FitOptions::default() });
     }
 
+    /// Above the interpolation cap the fit points become control points instead of a dense
+    /// system the size of their count squared (issue #702); just below it they still interpolate.
+    #[test]
+    fn too_many_fit_points_are_not_interpolated() {
+        let wave = |n: usize| -> Vec<Vec2> { (0..n).map(|i| Vec2::new((i * i) as f64 * 1e-3, (i % 5) as f64)).collect() };
+        let fit = wave(MAX_INTERP_POINTS + 1);
+        let s = Spline::fit_with(&fit, false, FitOptions::default());
+        assert_eq!(s.control, fit);
+        assert_eq!(s.knots, Spline::from_control(fit.clone(), 3).knots);
+        assert_eq!(s.fit, fit);
+
+        let c = Spline::fit_with(&fit, true, FitOptions::default());
+        let mut ring = fit.clone();
+        ring.extend(fit.first().copied());
+        assert!(c.closed);
+        assert_eq!(c.control, ring);
+        assert_eq!(c.fit, fit);
+
+        let few = wave(64);
+        assert!(passes_through(&Spline::fit_with(&few, false, FitOptions::default()), &few, 1e-6));
+        assert!(passes_through(&Spline::fit_with(&few, true, FitOptions::default()), &few, 1e-6));
+    }
+
     #[test]
     fn transform_turns_the_tangents() {
         let fit = pts();
         let mut s = Spline::fit_with(&fit, false, FitOptions { start_tangent: Some(Vec2::X), ..FitOptions::default() });
         s.transform(&Mat3::rotate(std::f64::consts::FRAC_PI_2));
         assert!(s.fit_opts.start_tangent.is_some_and(|t| t.near(Vec2::Y, 1e-12)));
+    }
+}
+
+#[cfg(test)]
+mod knot_boundary_tests {
+    use super::*;
+    #[test]
+    fn uniform_knots_skip_the_strict_lower_tolerance_boundary() {
+        let q = 2.0 / 3.0;
+        let mut s = Spline::from_control(vec![Vec2::ZERO; 5], 1);
+        s.fit = vec![Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(4.0, 0.0), Vec2::new(9.0, 0.0)];
+        s.knots = vec![0.0, 0.0, 1.0 / 3.0, q - 1e-6, q, 1.0, 1.0];
+        assert!(s.is_valid());
+        assert_eq!(s.infer_knot_param(), KnotParam::Uniform);
     }
 }

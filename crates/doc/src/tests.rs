@@ -17,6 +17,23 @@ fn new_drawing_has_standard_tables() {
 }
 
 #[test]
+fn new_metric_drawing_has_metric_multileader_and_table_styles() {
+    let m = Drawing::new_metric();
+    let iso = m.dim_style("ISO-25").unwrap();
+    let ml = m.mleader_styles.iter().find(|s| s.name == "Standard").unwrap();
+    assert_eq!((ml.text_height, ml.arrow_size), (iso.text_height, iso.arrow_size));
+    assert_eq!(ml.dogleg, 5.0);
+    let ts = m.table_styles.iter().find(|s| s.name == "Standard").unwrap();
+    assert_eq!(ts.text_height, iso.text_height);
+    assert_eq!(iso.text_height, 2.5);
+
+    let i = Drawing::new_imperial();
+    assert_eq!(i.mleader_styles, vec![MLeaderStyle::default()]);
+    assert_eq!(i.table_styles, vec![TableStyle::default()]);
+    assert_eq!((i.mleader_styles[0].text_height, i.table_styles[0].text_height), (0.18, 0.18));
+}
+
+#[test]
 fn add_and_extents() {
     let mut d = Drawing::new_imperial();
     d.add(&Space::Model, Common::default(), line((0.0, 0.0), (10.0, 5.0))).unwrap();
@@ -77,6 +94,59 @@ fn inserts_of_missing_or_empty_blocks_do_not_stretch_extents() {
     d.blocks.insert("Full".into(), std::sync::Arc::new(full));
     d.add(&Space::Model, Common::default(), ins("Full", 10.0, 10.0)).unwrap();
     assert_eq!(d.extents(&Space::Model).max, Vec2::new(12.0, 12.0));
+}
+
+#[test]
+fn visible_attributes_of_a_missing_block_still_count() {
+    // The renderer draws the attributes of a reference whose definition is missing, so they are
+    // extents and selection targets, as with an empty definition. The insertion point still isn't.
+    let attrib = |invisible: bool| Attrib {
+        tag: "TAG".into(),
+        text: Text {
+            insert: Vec3::new(1000.0, 1000.0, 0.0),
+            align_pt: None,
+            height: 10.0,
+            value: "hello".into(),
+            rotation: 0.0,
+            width_factor: 1.0,
+            oblique: 0.0,
+            style: "Standard".into(),
+            halign: HAlign::Left,
+            valign: VAlign::Baseline,
+        },
+        invisible,
+        constant: false,
+        prompt: String::new(),
+        props: Default::default(),
+        multiline: None,
+        modes: Default::default(),
+    };
+    let ins = |block: &str, attribs: Vec<Attrib>| {
+        Entity::new(
+            Handle(1),
+            EntityKind::Insert(Insert {
+                block: block.into(),
+                insert: Vec3::ZERO,
+                scale: Vec3::new(1.0, 1.0, 1.0),
+                rotation: 0.0,
+                attribs,
+                cols: 1,
+                rows: 1,
+                col_spacing: 0.0,
+                row_spacing: 0.0,
+            }),
+        )
+    };
+    let mut d = Drawing::new_imperial();
+    d.blocks.insert("Empty".into(), std::sync::Arc::new(Block::new("Empty")));
+    let missing = entity_bounds(&d, &ins("Missing", vec![attrib(false)]), 0);
+    let empty = entity_bounds(&d, &ins("Empty", vec![attrib(false)]), 0);
+    assert!(!missing.is_empty());
+    assert_eq!((missing.min, missing.max), (empty.min, empty.max));
+    assert_eq!(missing.min, Vec2::new(1000.0, 1000.0));
+    // Without a visible attribute there is nothing to measure.
+    assert!(entity_bounds(&d, &ins("Missing", vec![]), 0).is_empty());
+    assert!(entity_bounds(&d, &ins("Missing", vec![attrib(true)]), 0).is_empty());
 }
 
 #[test]
@@ -269,6 +339,38 @@ fn extents_pair(d: &Drawing) -> (Vec2, Vec2) {
     (b.min, b.max)
 }
 
+/// #706: block A reaches B once through a chain of 14 blocks (B at depth 15, its line's block E at
+/// 16, past the limit) and once directly (B at depth 1). `children` picks which of the two A holds.
+fn deep_and_shallow(children: &[&str]) -> Drawing {
+    let mut d = Drawing::new_imperial();
+    let mut add = |name: &str, kids: Vec<EntityKind>| {
+        let mut blk = Block::new(name);
+        for (i, k) in kids.into_iter().enumerate() {
+            blk.entities.push(Entity::new(Handle(i as u64 + 1), k));
+        }
+        d.blocks.insert(name.into(), std::sync::Arc::new(blk));
+    };
+    add("E", vec![line((1000.0, 1000.0), (2000.0, 1000.0))]);
+    add("B", vec![plain_insert("E")]);
+    for i in 1..=14 {
+        let next = if i == 14 { "B".to_string() } else { format!("C{}", i + 1) };
+        add(&format!("C{i}"), vec![plain_insert(&next)]);
+    }
+    add("A", children.iter().map(|c| plain_insert(c)).collect());
+    d.add(&Space::Model, Common::default(), plain_insert("A")).unwrap();
+    d
+}
+
+#[test]
+fn deep_block_visit_does_not_hide_a_shallow_reference() {
+    let line = (Vec2::new(1000.0, 1000.0), Vec2::new(2000.0, 1000.0));
+    // Control: past the limit, the deep path alone contributes nothing.
+    assert!(deep_and_shallow(&["C1"]).extents(&Space::Model).is_empty());
+    assert_eq!(extents_pair(&deep_and_shallow(&["B"])), line);
+    assert_eq!(extents_pair(&deep_and_shallow(&["B", "C1"])), line);
+    assert_eq!(extents_pair(&deep_and_shallow(&["C1", "B"])), line);
+}
+
 #[test]
 fn block_entity_with_invisible_flag_is_ignored_in_insert_extents() {
     let mut far = far_line("0");
@@ -354,6 +456,8 @@ fn attdef_in_block_is_ignored_in_insert_extents() {
             constant: false,
             prompt: String::new(),
             props: Default::default(),
+            multiline: None,
+            modes: Default::default(),
         }),
     );
     let d = drawing_with_block(attdef);
@@ -465,4 +569,15 @@ fn invisible_dimblock_entity_is_ignored_in_dimension_extents() {
     let mut d = Drawing::new_imperial();
     dim(&mut d, far_line("0"));
     assert_eq!(d.extents(&Space::Model).max, Vec2::new(6000.0, 6000.0));
+}
+
+#[test]
+fn space_names_its_tab() {
+    assert!(!Space::Model.is_paper());
+    assert_eq!(Space::Model.layout(), None);
+    assert_eq!(Space::Model.tab_name(), "Model");
+    let p = Space::Paper("Sheet A".into());
+    assert!(p.is_paper());
+    assert_eq!(p.layout(), Some("Sheet A"));
+    assert_eq!(p.tab_name(), "Sheet A");
 }

@@ -97,6 +97,9 @@ pub struct MTextParams {
     pub attach: u8,
     pub rotation: f64,
     pub line_spacing: f64,
+    /// Exactly: every line pitch is `line_spacing` times the entity height, whatever the line's
+    /// tallest character; At least (`false`): taller characters push lines apart.
+    pub line_spacing_exact: bool,
     /// Base font (the text style's), switched inline by `\f` / `\F`.
     pub font: TextFont,
     pub width_factor: f64,
@@ -114,6 +117,7 @@ impl MTextParams {
             attach: 1,
             rotation: 0.0,
             line_spacing: 1.0,
+            line_spacing_exact: false,
             font: TextFont::Stroke,
             width_factor: 1.0,
             oblique: 0.0,
@@ -497,6 +501,9 @@ struct Line {
     width: f64,
     max_h: f64,
     text: String,
+    /// Running character count of `text`, kept incrementally so appending a segment need not
+    /// rescan the whole accumulated line (which is multiplicative on a long line) (CWE-407).
+    chars: usize,
     /// Index of the paragraph the line belongs to.
     para: usize,
 }
@@ -576,9 +583,10 @@ pub fn layout_mtext_with(contents: &str, p: &MTextParams) -> MTextLayout {
                     finish(&mut lines, &mut line, fmt(last_fmt), para);
                 } else if !line.items.is_empty() || pending_space.is_some() {
                     if let Some(f) = pending_space {
-                        let at = line.text.chars().count();
+                        let at = line.chars;
                         line.items.push(Item { seg: None, fmt: f, x: line.width, w: sw, at });
                         line.text.push(' ');
+                        line.chars += 1;
                     }
                     line.width += sw;
                 }
@@ -586,8 +594,10 @@ pub fn layout_mtext_with(contents: &str, p: &MTextParams) -> MTextLayout {
                 for (sg, f) in segs {
                     let fw = seg_width(sg, fmt(*f));
                     line.max_h = line.max_h.max(fmt(*f).height);
-                    let at = line.text.chars().count();
-                    line.text.push_str(&seg_plain(sg));
+                    let at = line.chars;
+                    let plain = seg_plain(sg);
+                    line.chars += plain.chars().count();
+                    line.text.push_str(&plain);
                     line.items.push(Item { seg: Some(sg.clone()), fmt: *f, x: line.width, w: fw, at });
                     line.width += fw;
                     last_fmt = *f;
@@ -618,7 +628,13 @@ pub fn layout_mtext_with(contents: &str, p: &MTextParams) -> MTextLayout {
     let mut y = 0.0;
     for (i, l) in lines.iter().enumerate() {
         let lh = if l.max_h > 0.0 { l.max_h } else { h };
-        y -= if i == 0 { lh } else { lh * 5.0 / 3.0 * ls };
+        y -= if i == 0 {
+            lh
+        } else if p.line_spacing_exact {
+            h * 5.0 / 3.0 * ls
+        } else {
+            lh * 5.0 / 3.0 * ls
+        };
         baselines.push(y);
     }
     let block_h = -y;
@@ -669,6 +685,16 @@ pub fn layout_mtext_with(contents: &str, p: &MTextParams) -> MTextLayout {
 mod tests {
     use super::*;
 
+    /// Incremental character accounting preserves the text of a multi-word line without introducing wrapping.
+    #[test]
+    fn line_char_offsets_track_incrementally() {
+        // A multi-word line lays out correctly even though the per-line character count is now
+        // maintained incrementally rather than rescanned per segment (CWE-407, row 20).
+        let l = layout_mtext("alpha beta gamma", Vec2::ZERO, 1.0, 0.0, 1, 0.0, 1.0);
+        assert_eq!(l.lines.len(), 1, "no wrap width: one line");
+        assert_eq!(l.lines[0], "alpha beta gamma");
+    }
+
     #[test]
     fn strips_formatting() {
         assert_eq!(plain_mtext("{\\fArial|b1;Bold}\\Pline 2"), "Bold\nline 2");
@@ -701,6 +727,14 @@ mod tests {
 
     fn lay(s: &str, width: f64) -> MTextLayout {
         layout_mtext(s, Vec2::ZERO, 1.0, width, 1, 0.0, 1.0)
+    }
+
+    #[test]
+    fn indents_are_drawing_units() {
+        // An AutoCAD file's `\pi4.8634;` on 4.6652 high text in a 50.2 wide box indents the
+        // first line by 4.8634 units: the text still fits on one line.
+        let l = layout_mtext("\\pi4.8634;AAA BBB CCC", Vec2::ZERO, 4.6652, 50.2, 1, 0.0, 1.0);
+        assert_eq!(l.lines, vec!["AAA BBB CCC"]);
     }
 
     #[test]

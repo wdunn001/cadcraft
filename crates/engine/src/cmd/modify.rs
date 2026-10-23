@@ -11,6 +11,7 @@ use super::helpers::*;
 use super::machines::{SelOutcome, SelectPhase, number};
 use super::trimextend::{self, TrimM};
 use super::*;
+use crate::select::{SelectKind, SelectMode};
 use crate::{Accept, EngineError, Input, Interactive, Prompt, Result, Session, Step};
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -48,7 +49,7 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("stretch", "Stretch", run_stretch)
             .menu(&["Modify", "Stretch"])
             .alias(&["s"])
-            .params("{window: [[x,y],[x,y]], delta: [dx,dy]}")
+            .params("{window: [[x,y],[x,y]] | polygon: [[x,y],...] | fence: [[x,y],...], delta: [dx,dy]}")
             .interactive(|_| Ok(Box::new(StretchM::default()))),
         CommandSpec::new("offset", "Offset", run_offset)
             .menu(&["Modify", "Offset"])
@@ -91,7 +92,7 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("join", "Join", run_join)
             .menu(&["Modify", "Join"])
             .alias(&["j"])
-            .params("{handles?}")
+            .params("{handles?, close?: bool (a single arc becomes its circle, an elliptical arc its full ellipse)}")
             .interactive(|_| Ok(Box::new(SelectThen::new(Op::Join)))),
     ]
 }
@@ -201,9 +202,26 @@ fn run_mirror(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "handles": r.iter().map(|h| h.hex()).collect::<Vec<_>>() }))
 }
 
-/// Move the vertices of `e` that lie inside any of the windows `wins` by `d` (STRETCH).
-fn stretch_entity(e: &mut Entity, wins: &[cadcraft_geom::Bounds2], d: Vec2) {
-    let inside = |p: Vec2| wins.iter().any(|bx| bx.contains(p));
+/// An area whose vertices STRETCH moves: a window's box, or a polygon closed back to its first
+/// point.
+#[derive(Clone)]
+enum StretchArea {
+    Box(cadcraft_geom::Bounds2),
+    Polygon(Vec<Vec2>),
+}
+
+impl StretchArea {
+    fn contains(&self, p: Vec2) -> bool {
+        match self {
+            StretchArea::Box(bx) => bx.contains(p),
+            StretchArea::Polygon(poly) => cadcraft_geom::point_in_polygon(poly, p),
+        }
+    }
+}
+
+/// Move the vertices of `e` that lie inside any of the areas `wins` by `d` (STRETCH).
+fn stretch_entity(e: &mut Entity, wins: &[StretchArea], d: Vec2) {
+    let inside = |p: Vec2| wins.iter().any(|a| a.contains(p));
     let mv = |p: &mut cadcraft_geom::Vec3| {
         if inside(p.xy()) {
             p.x += d.x;
@@ -246,16 +264,34 @@ fn stretch_entity(e: &mut Entity, wins: &[cadcraft_geom::Bounds2], d: Vec2) {
 }
 
 fn run_stretch(s: &mut Session, p: &Value) -> Result<Value> {
-    let w = points_param(p, "window").ok_or_else(|| bad("stretch", "`window` [[x,y],[x,y]] is required"))?;
-    let (Some(a), Some(b)) = (w.first(), w.get(1)) else { return Err(bad("stretch", "window needs 2 corners")) };
-    let bx = cadcraft_geom::Bounds2::new(*a, *b);
     let d = delta_of("stretch", p)?;
     let space = s.space();
-    let mut hs = crate::select::select_window(s.doc()?, &space, bx, true);
+    let listed = |key: &str, least: usize| -> Result<Option<Vec<Vec2>>> {
+        let Some(pts) = points_param(p, key) else { return Ok(None) };
+        if pts.len() < least || pts.len() > crate::select::MAX_MODE_POINTS || pts.iter().any(|q| !q.is_finite()) {
+            return Err(bad("stretch", format!("`{key}` needs {least} to {} finite points", crate::select::MAX_MODE_POINTS)));
+        }
+        Ok(Some(pts))
+    };
+    // A fence marks no area: the objects it crosses move whole.
+    if let Some(fence) = listed("fence", 2)? {
+        let hs = crate::select::select_fence(s.doc()?, &space, &fence);
+        let moved = transform_entities(s, &hs, &Mat3::translate(d), false)?;
+        return Ok(json!({ "stretched": moved.len() }));
+    }
+    let (mut hs, area) = if let Some(poly) = listed("polygon", 3)? {
+        (crate::select::select_polygon(s.doc()?, &space, &poly, true), StretchArea::Polygon(poly))
+    } else {
+        let w = points_param(p, "window").ok_or_else(|| bad("stretch", "`window` [[x,y],[x,y]], `polygon` or `fence` is required"))?;
+        let (Some(a), Some(b)) = (w.first(), w.get(1)) else { return Err(bad("stretch", "window needs 2 corners")) };
+        let bx = cadcraft_geom::Bounds2::new(*a, *b);
+        (crate::select::select_window(s.doc()?, &space, bx, true), StretchArea::Box(bx))
+    };
     hs.retain(|h| !super::curves::is_locked(s, *h));
     let doc = s.doc_mut()?;
+    let areas = [area];
     for h in &hs {
-        doc.modify_entity(*h, |e| stretch_entity(e, &[bx], d))?;
+        doc.modify_entity(*h, |e| stretch_entity(e, &areas, d))?;
     }
     Ok(json!({ "stretched": hs.len() }))
 }
@@ -270,20 +306,20 @@ enum StretchPhase {
 }
 
 /// STRETCH: "Select objects" repeats until Enter. Crossing windows (implied right to left, or after
-/// `C`) and windows (left to right, or after `W`) select objects and mark the area whose vertices
-/// move; objects picked one at a time (or by All/Last/Previous) move whole. Then the base point or
-/// Displacement, and the second point.
+/// `C`), windows (left to right, or after `W`) and polygons (`CP`, `WP`) select objects and mark
+/// the area whose vertices move; objects picked one at a time (or by a fence, `F`, or
+/// All/Last/Previous) move whole. Then the base point or Displacement, and the second point.
 #[derive(Default)]
 struct StretchM {
     phase: StretchPhase,
     objs: Vec<Handle>,
     /// Objects selected without a window: they move whole.
     whole: Vec<Handle>,
-    /// The selection windows: vertices inside any of them move.
-    windows: Vec<cadcraft_geom::Bounds2>,
+    /// The selection windows and polygons: vertices inside any of them move.
+    windows: Vec<StretchArea>,
     removing: bool,
-    /// `C` (true) or `W` (false) was typed: the next two points are that kind of window.
-    mode: Option<bool>,
+    /// `C`, `W`, `BOX`, `CP`, `WP` or `F` was typed: the next points are that kind of selection.
+    mode: Option<SelectMode>,
     /// First corner of the window being drawn.
     corner: Option<Vec2>,
     base: Option<Vec2>,
@@ -313,20 +349,63 @@ impl StretchM {
         s.set_selection(self.objs.clone());
     }
 
+    /// Select with a typed mode that has its points. With too few (a fence of one point, a polygon
+    /// of two) the mode is dropped.
+    fn finish_mode(&mut self, s: &mut Session, m: SelectMode) -> Result<()> {
+        let space = s.space();
+        let Some(hs) = m.select(s.doc()?, &space) else { return Ok(()) };
+        let area = match (m.kind, m.pts.first().zip(m.pts.get(1))) {
+            (SelectKind::WPolygon | SelectKind::CPolygon, _) => Some(StretchArea::Polygon(m.pts)),
+            (SelectKind::Window | SelectKind::Crossing | SelectKind::Box, Some((a, b))) => {
+                Some(StretchArea::Box(cadcraft_geom::Bounds2::new(*a, *b)))
+            }
+            // A fence marks no area: what it crosses moves whole.
+            _ => None,
+        };
+        let whole = area.is_none();
+        if let (Some(a), false) = (area, self.removing) {
+            self.windows.push(a);
+        }
+        self.add(s, hs, whole);
+        Ok(())
+    }
+
     fn select(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if let Some(mut m) = self.mode.take() {
+            match &i {
+                Input::Point(p) => {
+                    if m.push(*p) {
+                        self.finish_mode(s, m)?;
+                    } else {
+                        self.mode = Some(m);
+                    }
+                    return Ok(Step::Continue);
+                }
+                Input::Text(t) | Input::Keyword(t) if matches!(t.trim().to_ascii_lowercase().as_str(), "u" | "undo") => {
+                    m.pts.pop();
+                    self.mode = Some(m);
+                    return Ok(Step::Continue);
+                }
+                // Enter ends a fence or closes a polygon.
+                Input::Enter => {
+                    self.finish_mode(s, m)?;
+                    return Ok(Step::Continue);
+                }
+                // Anything else leaves the mode and is read as usual.
+                _ => {}
+            }
+        }
         match i {
             Input::Point(p) => match self.corner.take() {
                 Some(c) => {
                     let bx = cadcraft_geom::Bounds2::new(c, p);
-                    let crossing = self.mode.take().unwrap_or(p.x < c.x);
                     let space = s.space();
-                    let hs = crate::select::select_window(s.doc()?, &space, bx, crossing);
+                    let hs = crate::select::select_window(s.doc()?, &space, bx, p.x < c.x);
                     if !self.removing {
-                        self.windows.push(bx);
+                        self.windows.push(StretchArea::Box(bx));
                     }
                     self.add(s, hs, false);
                 }
-                None if self.mode.is_some() => self.corner = Some(p),
                 None => {
                     let aperture = s.pixel_size() * s.settings.pickbox.max(1.0) * 1.5;
                     let space = s.space();
@@ -341,15 +420,14 @@ impl StretchM {
                 self.corner = None;
                 let d = s.doc()?;
                 let store = d.space(&s.space());
-                let picked = match t.trim().to_ascii_lowercase().as_str() {
-                    "c" | "crossing" => {
-                        self.mode = Some(true);
-                        None
-                    }
-                    "w" | "window" => {
-                        self.mode = Some(false);
-                        None
-                    }
+                let word = t.trim().to_ascii_lowercase();
+                // `_C`, `_L`: the English name, as scripts write it.
+                let word = word.strip_prefix('_').unwrap_or(&word).to_string();
+                if let Some(m) = SelectMode::from_keyword(&word).filter(|m| m.kind != SelectKind::Group) {
+                    self.mode = Some(m);
+                    return Ok(Step::Continue);
+                }
+                let picked = match word.as_str() {
                     "r" | "remove" => {
                         self.removing = true;
                         None
@@ -361,10 +439,6 @@ impl StretchM {
                     "all" => Some(store.map(|st| st.iter().filter(|e| d.is_visible(e)).map(|e| e.handle).collect()).unwrap_or_default()),
                     "l" | "last" => Some(store.and_then(|st| st.last()).map(|e| vec![e.handle]).unwrap_or_default()),
                     "p" | "previous" => Some(s.state()?.previous_selection.clone()),
-                    "cp" | "wp" | "f" | "fence" => {
-                        s.echo("Polygon and fence selection are not available yet in STRETCH; use a crossing window.");
-                        None
-                    }
                     _ => {
                         s.echo("*Invalid selection*");
                         None
@@ -374,10 +448,7 @@ impl StretchM {
                     self.add(s, hs, true);
                 }
             }
-            Input::Enter if self.corner.is_some() || self.mode.is_some() => {
-                self.corner = None;
-                self.mode = None;
-            }
+            Input::Enter if self.corner.is_some() => self.corner = None,
             Input::Enter if self.objs.is_empty() => return Ok(Step::Done),
             Input::Enter => {
                 s.remember_selection(&self.objs);
@@ -413,9 +484,11 @@ impl Interactive for StretchM {
         Ok(Step::Continue)
     }
     fn prompt(&self, _s: &Session) -> Prompt {
+        if let (StretchPhase::Select, Some(m)) = (self.phase, &self.mode) {
+            return m.prompt();
+        }
         match (self.phase, self.corner) {
             (StretchPhase::Select, Some(c)) => Prompt::new("Specify opposite corner", Accept::POINT).base(c),
-            (StretchPhase::Select, None) if self.mode.is_some() => Prompt::new("Specify first corner", Accept::POINT),
             (StretchPhase::Select, None) => Prompt::new(if self.removing { "Remove objects" } else { "Select objects" }, Accept::POINT),
             (StretchPhase::Base, _) => Prompt::new("Specify base point", Accept::POINT).kw(&["Displacement"]).default("Displacement"),
             (StretchPhase::Displacement, _) => Prompt::new("Specify displacement", Accept::POINT).default("0,0"),
@@ -446,11 +519,25 @@ impl Interactive for StretchM {
         }
     }
     fn preview(&self, s: &Session, c: Vec2) -> Vec<EntityKind> {
-        match (self.phase, self.corner, self.base) {
-            (StretchPhase::Select, Some(a), _) => {
-                let (b, d) = (Vec2::new(c.x, a.y), Vec2::new(a.x, c.y));
-                vec![line(a, b), line(b, c), line(c, d), line(d, a)]
+        let rect = |a: Vec2| {
+            let (b, d) = (Vec2::new(c.x, a.y), Vec2::new(a.x, c.y));
+            vec![line(a, b), line(b, c), line(c, d), line(d, a)]
+        };
+        if let (StretchPhase::Select, Some(m)) = (self.phase, &self.mode) {
+            let Some(first) = m.pts.first().copied() else { return Vec::new() };
+            if !matches!(m.kind, SelectKind::Fence | SelectKind::WPolygon | SelectKind::CPolygon) {
+                return rect(first);
             }
+            // The fence or polygon so far, on to the cursor; a polygon closes back to its start.
+            let mut out: Vec<EntityKind> = m.pts.windows(2).filter_map(|w| Some(line(*w.first()?, *w.get(1)?))).collect();
+            out.extend(m.pts.last().map(|l| line(*l, c)));
+            if m.kind != SelectKind::Fence && m.pts.len() >= 2 {
+                out.push(line(c, first));
+            }
+            return out;
+        }
+        match (self.phase, self.corner, self.base) {
+            (StretchPhase::Select, Some(a), _) => rect(a),
             (StretchPhase::Second, _, Some(base)) => {
                 let Ok(doc) = s.doc() else { return Vec::new() };
                 let m = Mat3::translate(c - base);
@@ -499,10 +586,14 @@ pub(crate) fn offset_kind(k: &EntityKind, dist: f64, side: Vec2) -> Option<Entit
         EntityKind::Ellipse(e) => {
             // Approximate with a polyline offset of the tessellation.
             let ge = cadcraft_geom::Ellipse { center: e.center.xy(), major: e.major.xy(), ratio: e.ratio, start: e.start, end: e.end };
+            // Inside = on the centre side of the full ellipse, even for an open arc.
             let inside = {
-                let mut pts = Vec::new();
-                ge.tessellate(e.major.xy().len() * 1e-3, &mut pts);
-                cadcraft_geom::point_in_polygon(&pts, side)
+                let a = e.major.xy().len();
+                let b = a * e.ratio.abs();
+                let u = e.major.xy().normalized();
+                let d = side - e.center.xy();
+                let (x, y) = (d.dot(u) * b, d.dot(u.perp()) * a);
+                x * x + y * y < (a * b) * (a * b)
             };
             // offset_points shifts along the left normal, which points into a counter-clockwise ellipse.
             let mut pts = Vec::new();
@@ -597,20 +688,40 @@ pub(crate) fn offset_polyline(pl: &Polyline, d: f64) -> Option<Vec<PolyVertex>> 
         return None;
     }
     let n = segs.len();
-    let mut verts: Vec<PolyVertex> = Vec::new();
+    // Where each offset segment starts after joining it to the previous one.
+    let mut starts: Vec<Vec2> = Vec::with_capacity(n);
     for i in 0..n {
         let s = segs.get(i)?;
-        let start = if i == 0 && !pl.closed {
+        starts.push(if i == 0 && !pl.closed {
             s.start()
         } else {
             let prev = segs.get((i + n - 1) % n)?;
             join_point(prev, s).unwrap_or(s.start())
+        });
+    }
+    let mut verts: Vec<PolyVertex> = Vec::new();
+    for i in 0..n {
+        let s = segs.get(i)?;
+        let start = *starts.get(i)?;
+        let end = if i + 1 < n {
+            *starts.get(i + 1)?
+        } else if pl.closed {
+            *starts.first()?
+        } else {
+            s.end()
         };
         let bulge = match s {
             Segment::Line(_) => 0.0,
             Segment::Arc { arc, ccw } => {
-                let sw = arc.sweep();
-                cadcraft_geom::arc_to_bulge(if *ccw { sw } else { -sw })
+                // The joined endpoints may have moved along the circle: take the sweep between them.
+                let sweep = if start.near(end, 1e-9) {
+                    arc.sweep()
+                } else if *ccw {
+                    ccw_sweep(arc.center.angle_to(start), arc.center.angle_to(end))
+                } else {
+                    ccw_sweep(arc.center.angle_to(end), arc.center.angle_to(start))
+                };
+                cadcraft_geom::arc_to_bulge(if *ccw { sweep } else { -sweep })
             }
         };
         verts.push(PolyVertex { p: start, bulge, start_width: 0.0, end_width: 0.0 });
@@ -618,7 +729,6 @@ pub(crate) fn offset_polyline(pl: &Polyline, d: f64) -> Option<Vec<PolyVertex>> 
     if !pl.closed {
         verts.push(PolyVertex::new(segs.last()?.end()));
     }
-    // Recompute arc bulges where endpoints moved (approximation: keep sweep sign).
     Some(verts)
 }
 
@@ -910,12 +1020,18 @@ fn trim_polyline(p: &cadcraft_doc::LwPolyline, cut: &[Segment], pick: Vec2) -> R
     let mut out = Vec::new();
     if p.closed {
         // Keep the complementary run from hi around to lo.
+        // The pick lies before the first cut or after the last: the piece wraps past the start
+        // vertex, so the run to keep is the stretch between the first and the last cut.
         let (lo, hi) = (
             if lo.is_finite() { lo } else { ts.last().copied().unwrap_or(0.0) - total },
             if hi.is_finite() { hi } else { ts.first().copied().unwrap_or(total) + total },
         );
         let doubled: Vec<Segment> = segs.iter().chain(segs.iter()).copied().collect();
-        let (a, b) = if hi > total { (hi - total, lo + total) } else { (hi, lo + total) };
+        let (a, mut b) = if hi > total { (hi - total, lo) } else { (hi, lo + total) };
+        // A single cut leaves the whole outline, opened there.
+        if b <= a + 1e-9 {
+            b += total;
+        }
         out.push(mk(sub_polyline(&doubled, a, b)));
     } else {
         if lo.is_finite() {
@@ -1287,6 +1403,16 @@ pub(crate) fn explode_kind(d: &cadcraft_doc::Drawing, e: &Entity) -> Option<Vec<
 }
 
 fn explode(s: &mut Session, hs: &[Handle]) -> Result<Vec<Handle>> {
+    explode_with(s, hs, explode_kind)
+}
+
+/// Replace each of `hs` (off locked layers) by the pieces `pieces` gives for it; objects it gives
+/// none for are left alone. EXPLODE, and BURST with its own pieces for block references.
+pub(crate) fn explode_with(
+    s: &mut Session,
+    hs: &[Handle],
+    pieces: impl Fn(&cadcraft_doc::Drawing, &Entity) -> Option<Vec<Entity>>,
+) -> Result<Vec<Handle>> {
     let space = s.space();
     let mut out = Vec::new();
     for h in hs {
@@ -1294,10 +1420,16 @@ fn explode(s: &mut Session, hs: &[Handle]) -> Result<Vec<Handle>> {
             continue;
         }
         let Some(e) = s.doc()?.entity(*h).map(|e| (**e).clone()) else { continue };
-        let Some(parts) = explode_kind(s.doc()?, &e) else { continue };
+        let Some(parts) = pieces(s.doc()?, &e) else { continue };
+        // The pieces of an object are new objects: its xdata goes with it. A block reference's
+        // pieces are copies of the block's objects and keep theirs.
+        let own_pieces = !matches!(e.kind, EntityKind::Insert(_));
         let d = s.doc_mut()?;
         d.remove_entity(*h);
         for mut p in parts {
+            if own_pieces {
+                p.common.xdata.clear();
+            }
             p.handle = d.new_handle();
             out.push(p.handle);
             if let Some(st) = d.space_mut(&space) {
@@ -1315,8 +1447,21 @@ fn run_explode(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "handles": r.iter().map(|h| h.hex()).collect::<Vec<_>>() }))
 }
 
+/// Gives a rebuilt arc piece its source centre Z, or a rebuilt polyline piece its source elevation.
+fn with_z(mut k: EntityKind, z: f64) -> EntityKind {
+    match &mut k {
+        EntityKind::Arc(a) => a.center.z = z,
+        EntityKind::LwPolyline(p) => p.elevation = z,
+        _ => {}
+    }
+    k
+}
+
 /// Break `h` between two points (or at one point when p1 == p2).
 pub(crate) fn break_entity(s: &mut Session, h: Handle, p1: Vec2, p2: Vec2) -> Result<Vec<Handle>> {
+    if super::curves::is_locked(s, h) {
+        return Err(EngineError::Other("The object is on a locked layer.".into()));
+    }
     let e = s.doc()?.entity(h).map(|e| (**e).clone()).ok_or_else(|| EngineError::Other("no such object".into()))?;
     let pieces: Vec<EntityKind> = match &e.kind {
         EntityKind::Line(l) => {
@@ -1325,12 +1470,13 @@ pub(crate) fn break_entity(s: &mut Session, h: Handle, p1: Vec2, p2: Vec2) -> Re
             if t1 > t2 {
                 std::mem::swap(&mut t1, &mut t2);
             }
+            let at3 = |t: f64| ln.at(t).to3(l.a.z + (l.b.z - l.a.z) * t);
             let mut v = Vec::new();
             if t1 > 1e-12 {
-                v.push(line(ln.a, ln.at(t1)));
+                v.push(EntityKind::Line(cadcraft_doc::Line { a: l.a, b: at3(t1) }));
             }
             if t2 < 1.0 - 1e-12 {
-                v.push(line(ln.at(t2), ln.b));
+                v.push(EntityKind::Line(cadcraft_doc::Line { a: at3(t2), b: l.b }));
             }
             v
         }
@@ -1341,7 +1487,7 @@ pub(crate) fn break_entity(s: &mut Session, h: Handle, p1: Vec2, p2: Vec2) -> Re
             let a1 = c.center.xy().angle_to(p1);
             let a2 = c.center.xy().angle_to(p2);
             // AutoCAD removes the CCW portion from the first to the second point.
-            vec![arc(&Arc::new(c.center.xy(), c.radius, a2, a1))]
+            vec![with_z(arc(&Arc::new(c.center.xy(), c.radius, a2, a1)), c.center.z)]
         }
         EntityKind::Arc(a) => {
             let ga = Arc::new(a.center.xy(), a.radius, a.start, a.end);
@@ -1352,15 +1498,15 @@ pub(crate) fn break_entity(s: &mut Session, h: Handle, p1: Vec2, p2: Vec2) -> Re
             }
             let mut v = Vec::new();
             if t1 > 1e-12 {
-                v.push(arc(&Arc::new(ga.center, ga.radius, ga.start, ga.start + t1)));
+                v.push(with_z(arc(&Arc::new(ga.center, ga.radius, ga.start, ga.start + t1)), a.center.z));
             }
             if t2 < ga.sweep() - 1e-12 {
-                v.push(arc(&Arc::new(ga.center, ga.radius, ga.start + t2, ga.end)));
+                v.push(with_z(arc(&Arc::new(ga.center, ga.radius, ga.start + t2, ga.end)), a.center.z));
             }
             v
         }
-        EntityKind::LwPolyline(p) if !p.closed => {
-            let pl = Polyline { vertices: p.vertices.clone(), closed: false };
+        EntityKind::LwPolyline(p) => {
+            let pl = Polyline { vertices: p.vertices.clone(), closed: p.closed };
             let segs = pl.segments();
             let total: f64 = segs.iter().map(Segment::len).sum();
             let lp = |q: Vec2| {
@@ -1377,17 +1523,28 @@ pub(crate) fn break_entity(s: &mut Session, h: Handle, p1: Vec2, p2: Vec2) -> Re
                 best.1
             };
             let (mut t1, mut t2) = (lp(p1), lp(p2));
-            if t1 > t2 {
-                std::mem::swap(&mut t1, &mut t2);
+            if p.closed {
+                if (t1 - t2).abs() < 1e-9 {
+                    return Err(EngineError::Other("Cannot break a closed polyline at a single point.".into()));
+                }
+                // Like a circle: the stretch from the first point to the second, along the
+                // vertices, goes; what is left runs from the second point round to the first.
+                let doubled: Vec<Segment> = segs.iter().chain(segs.iter()).copied().collect();
+                let end = if t1 > t2 { t1 } else { t1 + total };
+                vec![with_z(lwpoly(sub_polyline(&doubled, t2, end), false), p.elevation)]
+            } else {
+                if t1 > t2 {
+                    std::mem::swap(&mut t1, &mut t2);
+                }
+                let mut v = Vec::new();
+                if t1 > 1e-12 {
+                    v.push(with_z(lwpoly(sub_polyline(&segs, 0.0, t1), false), p.elevation));
+                }
+                if t2 < total - 1e-12 {
+                    v.push(with_z(lwpoly(sub_polyline(&segs, t2, total), false), p.elevation));
+                }
+                v
             }
-            let mut v = Vec::new();
-            if t1 > 1e-12 {
-                v.push(lwpoly(sub_polyline(&segs, 0.0, t1), false));
-            }
-            if t2 < total - 1e-12 {
-                v.push(lwpoly(sub_polyline(&segs, t2, total), false));
-            }
-            v
         }
         _ => return Err(EngineError::Other("Cannot break that object.".into())),
     };
@@ -1425,6 +1582,9 @@ fn run_breakat(s: &mut Session, p: &Value) -> Result<Value> {
 pub(crate) fn join(s: &mut Session, hs: &[Handle]) -> Result<Option<Handle>> {
     if let Some(h) = super::modify2::join_curves(s, hs)? {
         return Ok(Some(h));
+    }
+    if hs.iter().any(|h| super::curves::is_locked(s, *h)) {
+        return Err(EngineError::Other("An object is on a locked layer.".into()));
     }
     let d = s.doc()?;
     let mut segs: Vec<Segment> = Vec::new();
@@ -1502,6 +1662,10 @@ pub(crate) fn join(s: &mut Session, hs: &[Handle]) -> Result<Option<Handle>> {
 
 fn run_join(s: &mut Session, p: &Value) -> Result<Value> {
     let hs = targets(s, p)?;
+    if p.get("close").and_then(Value::as_bool) == Some(true) {
+        let h = super::modify2::join_close(s, &hs)?;
+        return Ok(json!({ "handle": h.hex() }));
+    }
     let r = join(s, &hs)?;
     Ok(json!({ "handle": r.map(|h| h.hex()) }))
 }
@@ -1538,6 +1702,8 @@ struct SelectThen {
     ref_len: Option<f64>,
     copy_mode: bool,
     ask_erase: bool,
+    /// JOIN of a single arc or elliptical arc: the prompt asks for arcs to join to it, or cLose.
+    join_source: Option<Handle>,
 }
 
 impl SelectThen {
@@ -1554,6 +1720,7 @@ impl SelectThen {
             ref_len: None,
             copy_mode: false,
             ask_erase: false,
+            join_source: None,
         }
     }
     fn apply(&mut self, s: &mut Session) -> Result<Step> {
@@ -1569,23 +1736,57 @@ impl SelectThen {
                 Ok(Step::Done)
             }
             Op::Join => {
-                match join(s, &self.objs) {
-                    Ok(h) => {
-                        // Objects outside the joined chain are kept, so count only the ones JOIN consumed
-                        // (and the source object an ellipse or spline join keeps).
-                        let d = s.doc()?;
-                        let n = self.objs.iter().filter(|o| d.entity(**o).is_none() || h == Some(**o)).count();
-                        let what = match h.and_then(|h| d.entity(h)).map(|e| &e.kind) {
-                            Some(EntityKind::Spline(_)) => "spline",
-                            Some(EntityKind::Ellipse(_)) => "ellipse",
-                            _ => "polyline",
-                        };
-                        s.echo(format!("{n} objects joined into 1 {what}"))
-                    }
-                    Err(e) => s.echo(e.to_string()),
+                if let [h] = self.objs[..]
+                    && s.doc()?.entity(h).is_some_and(|e| super::modify2::closed_kind(&e.kind).is_some())
+                {
+                    self.join_source = Some(h);
+                    return Ok(Step::Continue);
                 }
+                self.join_now(s)
+            }
+            _ => Ok(Step::Continue),
+        }
+    }
+
+    /// JOIN the selected objects and report what they became.
+    fn join_now(&mut self, s: &mut Session) -> Result<Step> {
+        match join(s, &self.objs) {
+            Ok(h) => {
+                // Objects outside the joined chain are kept, so count only the ones JOIN consumed
+                // (and the source object an ellipse or spline join keeps).
+                let d = s.doc()?;
+                let n = self.objs.iter().filter(|o| d.entity(**o).is_none() || h == Some(**o)).count();
+                let what = match h.and_then(|h| d.entity(h)).map(|e| &e.kind) {
+                    Some(EntityKind::Spline(_)) => "spline",
+                    Some(EntityKind::Ellipse(_)) => "ellipse",
+                    _ => "polyline",
+                };
+                s.echo(format!("{n} objects joined into 1 {what}"))
+            }
+            Err(e) => s.echo(e.to_string()),
+        }
+        Ok(Step::Done)
+    }
+
+    /// JOIN of a single arc or elliptical arc: more arcs picked join to it on Enter, cLose makes
+    /// it its circle or full ellipse.
+    fn join_source_input(&mut self, s: &mut Session, src: Handle, i: Input) -> Result<Step> {
+        match i {
+            Input::Keyword(k) if k == "cLose" => {
+                let ellipse = matches!(s.doc()?.entity(src).map(|e| &e.kind), Some(EntityKind::Ellipse(_)));
+                super::modify2::join_close(s, &[src])?;
+                s.echo(if ellipse { "The elliptical arc is now an ellipse." } else { "The arc is now a circle." });
                 Ok(Step::Done)
             }
+            Input::Point(p) => {
+                if let Some(h) = super::curves::pick_at(s, p)
+                    && !self.objs.contains(&h)
+                {
+                    self.objs.push(h);
+                }
+                Ok(Step::Continue)
+            }
+            Input::Enter => self.join_now(s),
             _ => Ok(Step::Continue),
         }
     }
@@ -1770,6 +1971,11 @@ impl Interactive for SelectThen {
         if self.ask_erase {
             return Prompt::new("Erase source objects?", Accept::TEXT).kw(&["Yes", "No"]).default("No");
         }
+        if let Some(src) = self.join_source {
+            let ellipse = s.doc().is_ok_and(|d| matches!(d.entity(src).map(|e| &e.kind), Some(EntityKind::Ellipse(_))));
+            let msg = if ellipse { "Select elliptical arcs to join to source" } else { "Select arcs to join to source" };
+            return Prompt::new(msg, Accept::POINT).kw(&["cLose"]);
+        }
         let k = self.pts.len();
         let base = self.pts.first().copied();
         if self.op == Op::Scale && self.reference {
@@ -1816,6 +2022,9 @@ impl Interactive for SelectThen {
                     return self.apply(s);
                 }
             }
+        }
+        if let Some(src) = self.join_source {
+            return self.join_source_input(s, src, i);
         }
         if self.ask_erase {
             let yes = matches!(&i, Input::Keyword(k) if k == "Yes") || matches!(&i, Input::Text(t) if t.trim().to_ascii_lowercase().starts_with('y'));

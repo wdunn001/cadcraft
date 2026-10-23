@@ -33,12 +33,24 @@ pub const PROFILE_VARS: &[&str] = &[
     "OSNAPHATCH",
     "LWDISPLAY",
     "QPMODE",
+    "SELECTIONEFFECT",
+    "SELECTIONPREVIEW",
+    "PREVIEWEFFECT",
+    "PREVIEWFILTER",
+    "GRIPS",
+    "GRIPOBJLIMIT",
+    "SELECTIONAREA",
+    "WINDOWAREACOLOR",
+    "CROSSINGAREACOLOR",
+    "SELECTIONAREAOPACITY",
+    "PICKSTYLE",
     "PICKBOX",
     "APERTURE",
     "GRIPSIZE",
     "CURSORSIZE",
     "PICKFIRST",
     "PICKADD",
+    "PICKDRAG",
     "MAXARRAY",
 ];
 
@@ -50,7 +62,7 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("options", "Options...", run_options)
             .menu(&["Tools", "Options..."])
             .alias(&["op", "preferences"])
-            .params("{reset?: bool, OSMODE?, PICKBOX?, APERTURE?, GRIPSIZE?, CURSORSIZE?, PICKFIRST?, PICKADD?, …: any profile variable}")
+            .params("{reset?: bool, OSMODE?, PICKBOX?, APERTURE?, GRIPSIZE?, CURSORSIZE?, PICKFIRST?, PICKADD?, PICKDRAG?: 0 (two clicks) | 2 (clicks or drag), …: any profile variable}")
             .enabled(always)
             .noundo(),
     ]
@@ -130,6 +142,7 @@ pub fn reset(s: &mut Session) {
     st.cursorsize = d.cursorsize;
     st.pickfirst = d.pickfirst;
     st.pickadd = d.pickadd;
+    st.pickdrag = d.pickdrag;
     st.maxarray = d.maxarray;
 }
 

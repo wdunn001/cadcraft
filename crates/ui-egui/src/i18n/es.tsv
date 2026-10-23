@@ -62,6 +62,7 @@
 	Area	Área
 	Arrange Panel	Organizar panel
 	Array	Matriz
+	Arrow size	Tamaño de flecha
 	Attach	Adjuntar
 	Attach DWG...	Adjuntar DWG...
 	Attribute	Atributo
@@ -226,6 +227,7 @@
 	Deselect All	Deseleccionar todo
 	Detach	Desenlazar
 	Diameter	Diámetro
+	Dim scale overall	Escala global de cota
 	Dim style	Estilo de cota
 	Dimension	Acotación
 	Dimension Break	Partir cota
@@ -769,6 +771,7 @@
 	Position X	Posición X
 	Position Y	Posición Y
 	Position Z	Posición Z
+	Precision	Precisión
 	Previous	Anterior
 	Previous Layer	Capa anterior
 	Primitives	Primitivas
@@ -813,6 +816,11 @@
 	Relative	Relativas
 	Remove Leader	Eliminar directriz
 	Remove the viewport override	Eliminar modificación de la ventana gráfica
+	Add to Working Set	Añadir al conjunto de trabajo
+	Edit Reference In-Place	Editar referencia in situ
+	Save Reference Edits	Guardar cambios de la referencia
+	Working Set	Conjunto de trabajo
+	Xref and Block In-place Editing	Edición in situ de xrefs y bloques
 	Rename Dimension Style	Renombrar estilo de cota
 	Rename Layer	Renombrar capa
 	Rename Layer State	Renombrar estado de capas
@@ -1172,7 +1180,7 @@
 	Viewports	Ventanas gráficas
 	Volume	Volumen
 	W	O
-	WCS ⌄	SCU ⌄
+	WCS	SCU
 	White	Blanco
 	Width factor	Factor de anchura
 	Window	Ventana
@@ -1214,6 +1222,8 @@
 	Hide Others	Ocultar otros
 	Accessibility	Accesibilidad
 	Show System Cursor	Mostrar cursor del sistema
+	Animation Effects	Efectos de animación
+	Animation effects	Efectos de animación
 	3D Mouse...	Ratón 3D...
 	3D Mouse	Ratón 3D
 	Calibrate 3D Mouse	Calibrar ratón 3D
@@ -1234,3 +1244,6 @@
 	Left device button: zoom extents. Right device button: calibrate.	Botón izquierdo del dispositivo: zoom a la extensión. Botón derecho: calibrar.
 	Hatch Pattern	Patrón de sombreado
 	Search for pattern	Buscar patrón
+	Not a number or distance: {text}	No es un número ni una distancia: {text}
+	Query Texts	Consultar textos
+	Analyze Shapes	Analizar formas

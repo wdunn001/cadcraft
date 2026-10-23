@@ -52,7 +52,7 @@ fn setvar(s: &mut Session, name: &str, value: serde_json::Value) {
 }
 
 fn query(base: Option<Vec2>, now: f64) -> CursorQuery {
-    CursorQuery { base, deferred: false, aperture: APERTURE, tol: TOL, now, shift: false }
+    CursorQuery { base, deferred: false, corner: false, aperture: APERTURE, tol: TOL, now, shift: false }
 }
 
 fn at(s: &mut Session, cursor: Vec2, base: Option<Vec2>) -> CursorSnap {
@@ -303,6 +303,39 @@ fn shift_to_acquire() {
 }
 
 #[test]
+fn shift_overrides_ortho_while_held() {
+    let mut s = session(0);
+    let base = Some(v(0.0, 0.0));
+    let held = |base| CursorQuery { shift: true, ..query(base, 100.0) };
+    // Ortho off: Shift turns it on.
+    assert_eq!(at(&mut s, v(5.0, 1.0), base).point, v(5.0, 1.0));
+    assert_eq!(s.snap_cursor(v(5.0, 1.0), &held(base)).point, v(5.0, 0.0));
+    // Ortho on: Shift turns it off.
+    s.execute("ortho", &json!({ "on": true })).unwrap();
+    assert_eq!(at(&mut s, v(5.0, 1.0), base).point, v(5.0, 0.0));
+    assert_eq!(s.snap_cursor(v(5.0, 1.0), &held(base)).point, v(5.0, 1.0));
+    assert!(s.settings.orthomode, "the override leaves ORTHOMODE as it was");
+    // No base point, or a window's first corner: nothing to constrain.
+    assert_eq!(s.snap_cursor(v(5.0, 1.0), &held(None)).point, v(5.0, 1.0));
+    s.execute("ortho", &json!({ "on": false })).unwrap();
+    let corner = CursorQuery { corner: true, ..held(base) };
+    assert_eq!(s.snap_cursor(v(5.0, 1.0), &corner).point, v(5.0, 1.0));
+}
+
+#[test]
+fn shift_ortho_override_wins_over_polar() {
+    let mut s = session(0);
+    s.execute("polar", &json!({ "on": true })).unwrap();
+    setvar(&mut s, "POLARANG", json!(45));
+    let base = Some(v(0.0, 0.0));
+    // Near the 45° polar path the cursor follows it; with Shift held ortho does instead.
+    let free = at(&mut s, v(5.0, 5.05), base);
+    assert!(free.track.is_some() && free.point.near(v(5.025, 5.025), 1e-9), "{free:?}");
+    let held = s.snap_cursor(v(5.0, 5.05), &CursorQuery { shift: true, ..query(base, 100.0) });
+    assert_eq!((held.point, held.track), (v(0.0, 5.05), None));
+}
+
+#[test]
 fn sysvars_polarmode_polaraddang_autosnap() {
     let mut s = Session::new();
     let get = |s: &Session, n: &str| cadcraft_engine::sysvars::get(s, n).unwrap();
@@ -345,7 +378,7 @@ fn hostile_inputs_never_panic() {
     for x in nums {
         for ap in [APERTURE, 0.0, -1.0, f64::NAN, f64::INFINITY, 1e300] {
             for base in [None, Some(v(x, 0.0)), Some(Vec2::ZERO)] {
-                let q = CursorQuery { base, deferred: true, aperture: ap, tol: ap, now: x, shift: x.is_nan() };
+                let q = CursorQuery { base, deferred: true, corner: false, aperture: ap, tol: ap, now: x, shift: x.is_nan() };
                 let _ = s.snap_cursor(v(x, 0.5), &q);
                 let r = s.snap_cursor(v(10.0, x), &q);
                 assert!(r.track.is_none_or(|t| t.point.is_finite()));

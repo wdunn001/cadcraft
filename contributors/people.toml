@@ -48,3 +48,28 @@ sync_github_name = true
 
 [people.Losminek]
 sync_github_name = true
+
+[people.GJoe2]
+sync_github_name = true
+
+[people.holmbom]
+real_name = "Erik Holmbom"
+display_name = "Erik Holmbom"
+sync_github_name = false
+
+[people.cyfung1031]
+real_name = "Chester Fung"
+display_name = "Chester Fung"
+sync_github_name = true
+
+[people.C00kieMonsta]
+real_name = "Antoine Boxho"
+display_name = "Antoine Boxho"
+sync_github_name = true
+
+[people.Silvertree2010]
+display_name = "Netter"
+sync_github_name = false
+
+[people.gurparvez]
+real_name = "Gurparvez"

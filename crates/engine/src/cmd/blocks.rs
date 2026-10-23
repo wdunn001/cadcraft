@@ -1,5 +1,7 @@
-//! Blocks: BLOCK, INSERT, ATTDEF, ATTEDIT (programmatic), WBLOCK, BASE, PURGE, block listing.
+//! Blocks: BLOCK, INSERT, ATTDEF, ATTEDIT (programmatic), WBLOCK, BASE, PURGE, block listing, the
+//! Block Editor.
 
+pub(crate) mod bedit;
 mod purge;
 
 use std::sync::Arc;
@@ -14,7 +16,10 @@ use super::*;
 use crate::{Accept, EngineError, Input, Interactive, Prompt, Result, Session, Step};
 
 mod attedit;
+mod burst;
+mod dyngrip;
 mod extract;
+pub(crate) mod refedit;
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -42,6 +47,24 @@ pub fn specs() -> Vec<CommandSpec> {
         attedit::dash_attedit_spec(),
         CommandSpec::new("wblock", "Write Block", run_wblock).alias(&["w"]).params("{path, name? | handles?, base?}"),
         CommandSpec::new("base", "Base", run_base).menu(&["Draw", "Block", "Base"]).params("{at: [x,y]}"),
+        CommandSpec::new("blocks.dynamic", "Dynamic Block Data", run_dynamic)
+            .params("{name (a block, or \"*Model_Space\" for a drawing that is a dynamic block's own)} → {parameters, actions, other} | null (not a dynamic block)")
+            .enabled(has_doc)
+            .noundo(),
+        CommandSpec::new("blocks.reference", "Dynamic Block Reference", run_reference)
+            .params("{handle (a block reference)} → {definition, values (by parameter graph id), properties: [{name, value, choices}]} | null (not a dynamic block reference)")
+            .enabled(has_doc)
+            .noundo(),
+        CommandSpec::new("blocks.reference.set", "Set Dynamic Property", run_reference_set)
+            .params("{handle (a dynamic block reference), name (a custom property as Properties names it: a visibility state, a lookup, a distance or \"Position1 X\"), value (lengths in drawing units)} → {properties}")
+            .enabled(has_doc),
+        CommandSpec::new("blocks.reference.grips", "Dynamic Block Grips", dyngrip::run_grips)
+            .params("{handle} → [{node, part: base|end|at, shape: linear|point|list, at: [x,y], dir: [x,y], property, choices?}] (empty: not a dynamic block reference)")
+            .enabled(has_doc)
+            .noundo(),
+        CommandSpec::new("blocks.reference.grip", "Drag Dynamic Grip", dyngrip::run_grip)
+            .params("{handle, node (the parameter's graph id), part: base|end|at, to: [x,y] (drawing coordinates)} → {properties}: a distance's arrow changes the distance (snapped to its values), a position's square moves it")
+            .enabled(has_doc),
         CommandSpec::new("purge", "Purge", purge::run)
             .alias(&["pu", "-purge"])
             .params("{type?: all|blocks|dimstyles|groups|layers|linetypes|mleaderstyles|tablestyles|textstyles|zerolength|emptytext (default all: every named type), names?: \"A*,B\" (default *)} → purged")
@@ -50,11 +73,14 @@ pub fn specs() -> Vec<CommandSpec> {
         battman::battman_spec(),
         attribs::attdisp_spec(),
         attribs::attsync_spec(),
+        burst::burst_spec(),
         extract::dataextraction_spec(),
         extract::eattext_spec(),
     ]
     .into_iter()
     .chain(xref::specs())
+    .chain(refedit::specs())
+    .chain(bedit::specs())
     .collect()
 }
 
@@ -84,8 +110,41 @@ fn references_block(d: &cadcraft_doc::Drawing, ents: &[Entity], name: &str) -> b
     false
 }
 
+/// What BLOCK does with the selected objects once the block is defined (the dialog's Convert to
+/// block, Retain and Delete).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Keep {
+    /// Replace the objects by a reference to the new block.
+    Convert,
+    /// Leave the objects in the drawing.
+    Retain,
+    /// Erase the objects.
+    Delete,
+}
+
+impl Keep {
+    /// The `keep` parameter's documented values, in any case; `None` for anything else.
+    pub(crate) fn parse(value: &str) -> Option<Keep> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "convert" => Some(Keep::Convert),
+            "retain" => Some(Keep::Retain),
+            "delete" => Some(Keep::Delete),
+            _ => None,
+        }
+    }
+}
+
+/// The `keep` parameter of `cmd`, `default` when absent. A value that is not documented is an
+/// error (issue #935: a misspelt value used to erase the objects without converting them).
+fn keep_param(cmd: &str, p: &Value, default: Keep) -> Result<Keep> {
+    match str_param(p, "keep") {
+        None => Ok(default),
+        Some(v) => Keep::parse(v).ok_or_else(|| bad(cmd, format!("`keep` must be \"convert\", \"retain\" or \"delete\", not {v:?}"))),
+    }
+}
+
 /// Create a block from entities. Returns the insert handle when converting.
-pub(crate) fn make_block(s: &mut Session, name: &str, base: Vec2, hs: &[Handle], keep: &str, description: &str) -> Result<Option<Handle>> {
+pub(crate) fn make_block(s: &mut Session, name: &str, base: Vec2, hs: &[Handle], keep: Keep, description: &str) -> Result<Option<Handle>> {
     if !valid_block_name(name) {
         return Err(bad("block", "invalid block name"));
     }
@@ -96,6 +155,9 @@ pub(crate) fn make_block(s: &mut Session, name: &str, base: Vec2, hs: &[Handle],
     }
     if references_block(d, &ents, name) {
         return Err(bad("block", format!("Block \"{name}\" references itself.")));
+    }
+    if d.refedit.as_ref().is_some_and(|r| r.block.eq_ignore_ascii_case(name)) {
+        return Err(bad("block", format!("Block \"{name}\" is being edited in place; finish with REFCLOSE first.")));
     }
     // Block names are case-insensitive: redefining keeps the existing definition's name.
     let name = d.blocks.keys().find(|k| k.eq_ignore_ascii_case(name)).cloned().unwrap_or_else(|| name.to_string());
@@ -109,13 +171,13 @@ pub(crate) fn make_block(s: &mut Session, name: &str, base: Vec2, hs: &[Handle],
         b.entities.push(e);
     }
     doc.blocks.insert(name.to_string(), Arc::new(b));
-    if keep != "retain" {
+    if keep != Keep::Retain {
         for h in hs {
             doc.remove_entity(*h);
         }
     }
     s.set_selection(Vec::new());
-    if keep == "convert" {
+    if keep == Keep::Convert {
         let h = insert(s, name, base, 1.0, 0.0, &serde_json::Map::new())?;
         return Ok(Some(h));
     }
@@ -180,6 +242,8 @@ pub(crate) fn insert_with(
                 constant: false,
                 prompt: String::new(),
                 props: Default::default(),
+                multiline: ad.multiline.as_ref().map(|ml| ml.transformed(&m)),
+                modes: ad.modes.for_reference(),
             });
         }
     }
@@ -190,8 +254,8 @@ fn run_block(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_param(p, "name").ok_or_else(|| bad("block", "`name` is required"))?.to_string();
     let base = point_param(p, "base").unwrap_or(Vec2::ZERO);
     let hs = targets(s, p)?;
-    let keep = str_param(p, "keep").unwrap_or("convert").to_string();
-    let r = make_block(s, &name, base, &hs, &keep, str_param(p, "description").unwrap_or(""))?;
+    let keep = keep_param("block", p, Keep::Convert)?;
+    let r = make_block(s, &name, base, &hs, keep, str_param(p, "description").unwrap_or(""))?;
     // An annotative block: its references (the converted selection too) are annotative.
     if bool_or(p, "annotative", false) {
         let d = s.doc_mut()?;
@@ -252,6 +316,8 @@ fn attdef_kind(s: &Session, tag: &str, prompt: &str, default: &str, at: Vec2, he
         constant: false,
         prompt: prompt.into(),
         props: Default::default(),
+        multiline: None,
+        modes: Default::default(),
     })
 }
 
@@ -321,9 +387,61 @@ fn run_base(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn run_list(s: &mut Session, _p: &Value) -> Result<Value> {
     let d = s.doc()?;
-    Ok(
-        json!({ "blocks": d.blocks.values().filter(|b| !b.anonymous).map(|b| json!({"name": b.name, "entities": b.entities.len(), "base": [b.base.x, b.base.y], "description": b.description})).collect::<Vec<_>>() }),
-    )
+    let block = |b: &Block| {
+        let dynamic = cadcraft_doc::dynblock::dynamic_block(d, &b.name).is_some();
+        json!({"name": b.name, "entities": b.entities.len(), "base": [b.base.x, b.base.y], "description": b.description, "dynamic": dynamic})
+    };
+    Ok(json!({ "blocks": d.blocks.values().filter(|b| !b.anonymous).map(|b| block(b)).collect::<Vec<_>>() }))
+}
+
+/// A dynamic block's parameters and actions as read from the file (null for a block that has
+/// none).
+fn run_dynamic(s: &mut Session, p: &Value) -> Result<Value> {
+    let name = str_param(p, "name").ok_or_else(|| bad("blocks.dynamic", "`name` is required"))?;
+    let d = s.doc()?;
+    if d.block(name).is_none() && !name.trim().eq_ignore_ascii_case("*Model_Space") {
+        return Err(bad("blocks.dynamic", format!("no block `{name}`")));
+    }
+    serde_json::to_value(cadcraft_doc::dynblock::dynamic_block(d, name)).map_err(|e| bad("blocks.dynamic", e.to_string()))
+}
+
+/// The dynamic block a block reference shows, the values it was given and its custom properties
+/// (null for any other reference).
+fn run_reference(s: &mut Session, p: &Value) -> Result<Value> {
+    let h = super::curves::handle_param(p, "handle").ok_or_else(|| bad("blocks.reference", "`handle` is required"))?;
+    let d = s.doc()?;
+    match d.entity(h).map(|e| &e.kind) {
+        Some(EntityKind::Insert(_)) => {}
+        Some(_) => return Err(bad("blocks.reference", "`handle` is not a block reference")),
+        None => return Err(bad("blocks.reference", format!("no object {}", h.hex()))),
+    }
+    let (Some(r), Some((_, properties))) = (cadcraft_doc::dynblock::reference(d, h), cadcraft_doc::dynblock::custom_properties(d, h)) else {
+        return Ok(Value::Null);
+    };
+    Ok(json!({ "definition": r.definition, "values": r.values, "properties": properties }))
+}
+
+/// Change a custom property of a dynamic block reference (one undo step).
+fn run_reference_set(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "blocks.reference.set";
+    let h = super::curves::handle_param(p, "handle").ok_or_else(|| bad(cmd, "`handle` is required"))?;
+    let name = str_param(p, "name").ok_or_else(|| bad(cmd, "`name` is required"))?;
+    let value = match p.get("value") {
+        Some(Value::String(v)) => v.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => return Err(bad(cmd, "`value` is required")),
+    };
+    if !matches!(s.doc()?.entity(h).map(|e| &e.kind), Some(EntityKind::Insert(_))) {
+        return Err(bad(cmd, "`handle` is not a block reference"));
+    }
+    if super::curves::is_locked(s, h) {
+        return Err(bad(cmd, "the reference is on a locked layer"));
+    }
+    let mut d = s.doc()?.clone();
+    cadcraft_doc::dynblock::set_property(&mut d, h, name, &value).map_err(|e| bad(cmd, e))?;
+    let properties = cadcraft_doc::dynblock::custom_properties(&d, h).map(|(_, p)| p).unwrap_or_default();
+    *s.doc_mut()? = d;
+    Ok(json!({ "properties": properties }))
 }
 
 // ---------------- interactive ----------------
@@ -412,7 +530,7 @@ impl BlockM {
     fn finish(&mut self, s: &mut Session, hs: &[Handle]) -> Result<Step> {
         let (Some(name), Some(base)) = (self.name.clone(), self.base) else { return Ok(Step::Cancel) };
         // A definition that can't be made (e.g. one that would reference itself) ends the command.
-        let keep = if self.dash { "delete" } else { "convert" };
+        let keep = if self.dash { Keep::Delete } else { Keep::Convert };
         if let Err(e) = make_block(s, &name, base, hs, keep, "") {
             s.echo(e.to_string());
             return Ok(Step::Done);

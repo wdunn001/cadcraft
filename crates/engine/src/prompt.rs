@@ -41,6 +41,10 @@ pub struct Prompt {
     /// prompt (a point with no base yet, e.g. the first point of a line). Elsewhere a deferred
     /// pick arrives as the plain point it was picked at.
     pub deferred: bool,
+    /// The base is a rectangle's first corner (ZOOM Window, RECTANG, ARRAYRECT's unit cell): ortho
+    /// does not bend the opposite corner, so the rectangle keeps its area.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub corner: bool,
     /// The grip this prompt stretches (one hot grip at the STRETCH prompt), as (object, grip
     /// index): Dynamic Input shows its dimensions ([`crate::grip_dims`]).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -49,6 +53,29 @@ pub struct Prompt {
     /// [`Input::Text`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub picker: Option<Picker>,
+    /// Shown as written, without keywords, a default or a colon added: an AutoLISP `get…`
+    /// prompt (the routine writes all of it).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub raw: bool,
+    /// The prompt asks for a distance from `base` (a radius, a diameter, a length), and a point
+    /// answers with its distance from it: Dynamic Input shows one distance field instead of the
+    /// pointer boxes.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub distance: bool,
+    /// The prompt picks one object whatever it says: an AutoLISP `entsel`/`nentsel`, whose message
+    /// the routine writes, so it cannot be read for the word "Select" (#1598).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub picks_one: bool,
+}
+
+/// Parse `@distance<angle` (relative polar), returning `(distance, angle in radians)`.
+/// Returns `None` for any other form.
+pub fn parse_polar_text(text: &str, angles: &crate::units::AngleSettings) -> Option<(f64, f64)> {
+    let body = text.trim().strip_prefix('@')?; // relative form only
+    let (d, a) = body.split_once('<')?;
+    let dist = d.trim().parse::<f64>().ok()?;
+    let angle = angles.amount(a.trim())?;
+    (dist.is_finite() && angle.is_finite()).then_some((dist, angle))
 }
 
 /// A visual chooser for a prompt ([`Prompt::picker`]).
@@ -61,7 +88,7 @@ pub enum Picker {
 
 impl Prompt {
     pub fn new(message: impl Into<String>, accept: Accept) -> Self {
-        Prompt { message: message.into(), keywords: Vec::new(), default: None, accept, base: None, deferred: false, grip: None, picker: None }
+        Prompt { message: message.into(), accept, ..Default::default() }
     }
     /// The grip being stretched (the `grip` field).
     pub fn grip(mut self, g: (Handle, usize)) -> Self {
@@ -85,6 +112,17 @@ impl Prompt {
         self.base = p;
         self
     }
+    /// The base is a window's first corner (the `corner` field).
+    pub fn corner(mut self, p: Vec2) -> Self {
+        self.base = Some(p);
+        self.corner = true;
+        self
+    }
+    /// Asks for a distance from the base (the `distance` field).
+    pub fn distance(mut self) -> Self {
+        self.distance = true;
+        self
+    }
     /// Accept deferred tangent/perpendicular snaps (the `deferred` field).
     pub fn deferred(mut self) -> Self {
         self.deferred = true;
@@ -94,14 +132,20 @@ impl Prompt {
         self.default = Some(d.into());
         self
     }
-    /// The prompt picks objects: a "Select objects" prompt, or a point prompt whose click selects
-    /// one object ("Select object to offset", "Select first line"…, the commands that pick a
-    /// single object themselves). The UI shows the pick box there.
+    /// The prompt picks objects: a "Select objects" prompt, one that says it picks a single object
+    /// ([`Prompt::picks_one`]), or a point prompt whose click selects one ("Select object to
+    /// offset", "Select first line"…, the commands that pick a single object themselves). The UI
+    /// shows the pick box there. The wording is only read where the engine wrote it: a routine
+    /// writes its own message (`raw`), which may open with "Select" and still ask for a point,
+    /// and says through `picks_one` when it picks instead (#1635 review).
     pub fn picks_objects(&self) -> bool {
-        self.accept.select || (self.accept.point && self.message.starts_with("Select"))
+        self.picks_one || self.accept.select || (self.accept.point && !self.raw && self.message.starts_with("Select"))
     }
     /// "Specify next point or [Undo/Close] <default>:".
     pub fn display(&self) -> String {
+        if self.raw {
+            return self.message.trim_matches(['\n', '\r']).to_string();
+        }
         let mut s = self.message.clone();
         if !self.keywords.is_empty() {
             // A question offers its answers ("Fix any errors detected? [Yes/No]"); anything else
@@ -182,10 +226,21 @@ pub trait Interactive: Send {
     fn preview(&self, _s: &Session, _cursor: Vec2) -> Vec<EntityKind> {
         Vec::new()
     }
+    /// Preview objects drawn with their own properties (colour, layer, linetype) rather than
+    /// the current layer's, as [`Interactive::preview`]'s are: a block reference re-evaluated
+    /// under the cursor, drawn as it will look. Drawn under the rubber band.
+    fn preview_objects(&self, _s: &Session, _cursor: Vec2) -> Vec<cadcraft_doc::Entity> {
+        Vec::new()
+    }
     /// The preview as existing objects under one transform, when it is that (MOVE, COPY,
     /// ROTATE, SCALE). The UI then draws them from geometry uploaded once instead of rebuilding
     /// the transformed copies every frame; `None` falls back to [`Interactive::preview`].
     fn drag(&self, _s: &Session, _cursor: Vec2) -> Option<Drag> {
+        None
+    }
+    /// The multiline text being typed (MTEXT, once its box is known) with empty contents: where
+    /// the UI places its in-place editor and with which height, width and justification.
+    fn editing_mtext(&self) -> Option<cadcraft_doc::MText> {
         None
     }
 }

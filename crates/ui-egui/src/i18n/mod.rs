@@ -15,6 +15,8 @@ pub enum Preference {
     Auto,
     #[serde(rename = "en")]
     English,
+    #[serde(rename = "el")]
+    Greek,
     #[serde(rename = "uk")]
     Ukrainian,
     #[serde(rename = "pt-BR")]
@@ -31,12 +33,25 @@ pub enum Preference {
     French,
     #[serde(rename = "zh")]
     Chinese,
+    #[serde(rename = "it")]
+    Italian,
+    #[serde(rename = "ko")]
+    Korean,
+    #[serde(rename = "sv")]
+    Swedish,
+    #[serde(rename = "ar")]
+    Arabic,
+    #[serde(rename = "hu")]
+    Hungarian,
+    #[serde(rename = "tr")]
+    Turkish,
 }
 
 impl Preference {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 17] = [
         Self::Auto,
         Self::English,
+        Self::Greek,
         Self::Ukrainian,
         Self::BrazilianPortuguese,
         Self::German,
@@ -45,6 +60,12 @@ impl Preference {
         Self::Russian,
         Self::French,
         Self::Chinese,
+        Self::Italian,
+        Self::Korean,
+        Self::Swedish,
+        Self::Arabic,
+        Self::Hungarian,
+        Self::Turkish,
     ];
 
     /// The codes a preference can be given as, for messages ("auto, en or uk").
@@ -60,6 +81,7 @@ impl Preference {
         match self {
             Self::Auto => "auto",
             Self::English => "en",
+            Self::Greek => "el",
             Self::Ukrainian => "uk",
             Self::BrazilianPortuguese => "pt-BR",
             Self::German => "de",
@@ -68,6 +90,12 @@ impl Preference {
             Self::Russian => "ru",
             Self::French => "fr",
             Self::Chinese => "zh",
+            Self::Italian => "it",
+            Self::Korean => "ko",
+            Self::Swedish => "sv",
+            Self::Arabic => "ar",
+            Self::Hungarian => "hu",
+            Self::Turkish => "tr",
         }
     }
 
@@ -75,6 +103,7 @@ impl Preference {
         match self {
             Self::Auto => t("Auto (system language)"),
             Self::English => "English",
+            Self::Greek => "Ελληνικά",
             Self::Ukrainian => "Українська",
             Self::BrazilianPortuguese => "Português (Brasil)",
             Self::German => "Deutsch",
@@ -83,6 +112,18 @@ impl Preference {
             Self::Russian => "Русский",
             Self::French => "Français",
             Self::Chinese => "简体中文",
+            Self::Italian => "Italiano",
+            Self::Korean => {
+                if crate::theme::shows_hangul(CURRENT.with(Cell::get)) {
+                    "한국어"
+                } else {
+                    "Korean"
+                }
+            }
+            Self::Swedish => "Svenska",
+            Self::Arabic => "العربية",
+            Self::Hungarian => "Magyar",
+            Self::Turkish => "Türkçe",
         }
     }
 
@@ -98,6 +139,7 @@ impl Preference {
     pub fn resolve(self, locales: &[String]) -> &'static str {
         match self {
             Self::English => "en",
+            Self::Greek => "el",
             Self::Ukrainian => "uk",
             Self::BrazilianPortuguese => "pt-BR",
             Self::German => "de",
@@ -106,6 +148,12 @@ impl Preference {
             Self::Russian => "ru",
             Self::French => "fr",
             Self::Chinese => "zh",
+            Self::Italian => "it",
+            Self::Korean => "ko",
+            Self::Swedish => "sv",
+            Self::Arabic => "ar",
+            Self::Hungarian => "hu",
+            Self::Turkish => "tr",
             Self::Auto => locales.iter().find_map(|s| locale_language(s)).unwrap_or("en"),
         }
     }
@@ -122,8 +170,10 @@ pub struct Language {
     catalog: OnceLock<Catalog<'static>>,
 }
 
-pub static LANGUAGES: [Language; 9] = [
+pub static LANGUAGES: [Language; 16] = [
     Language { code: "en", name: "English", source: "", plural: plural_en, plural_forms: 2, catalog: OnceLock::new() },
+    // Greek: one for exactly 1; other for zero and all other integer counts.
+    Language { code: "el", name: "Ελληνικά", source: include_str!("el.tsv"), plural: plural_en, plural_forms: 2, catalog: OnceLock::new() },
     Language {
         code: "uk", name: "Українська", source: include_str!("uk.tsv"), plural: plural_uk, plural_forms: 3, catalog: OnceLock::new()
     },
@@ -147,6 +197,20 @@ pub static LANGUAGES: [Language; 9] = [
     // Chinese has no grammatical plural: both `@plural` forms read the same. Its glyphs come from
     // an installed CJK font (`theme::cjk_font`); without one the interface stays English.
     Language { code: "zh", name: "简体中文", source: include_str!("zh.tsv"), plural: plural_en, plural_forms: 2, catalog: OnceLock::new() },
+    // Italian integer plurals (CLDR `it`) follow the English rule: one (1), other.
+    Language { code: "it", name: "Italiano", source: include_str!("it.tsv"), plural: plural_en, plural_forms: 2, catalog: OnceLock::new() },
+    // Korean has one integer plural form and needs a Hangul-capable interface font.
+    Language { code: "ko", name: "한국어", source: include_str!("ko.tsv"), plural: plural_ko, plural_forms: 1, catalog: OnceLock::new() },
+    // Swedish plurals follow the English rule: one (1), other.
+    Language { code: "sv", name: "Svenska", source: include_str!("sv.tsv"), plural: plural_en, plural_forms: 2, catalog: OnceLock::new() },
+    // العربية (Arabic) is right-to-left; an installed Arabic font (`theme::arabic_font`)
+    // covers its glyphs, and the shell keeps egui's left-to-right run order. Six plural
+    // forms: zero, one, two, few, many, other.
+    Language { code: "ar", name: "العربية", source: include_str!("ar.tsv"), plural: plural_arabic, plural_forms: 6, catalog: OnceLock::new() },
+    // Hungarian uses the singular after a numeral, so one form covers every count (the Korean rule).
+    Language { code: "hu", name: "Magyar", source: include_str!("hu.tsv"), plural: plural_ko, plural_forms: 1, catalog: OnceLock::new() },
+    // Turkish keeps a noun singular after a number ("3 commit"), so like Korean it has one form.
+    Language { code: "tr", name: "Türkçe", source: include_str!("tr.tsv"), plural: plural_ko, plural_forms: 1, catalog: OnceLock::new() },
 ];
 
 /// BCP 47 and POSIX locale tags, including `uk-UA`, `uk_UA.UTF-8` and `pt_BR.UTF-8`.
@@ -256,6 +320,24 @@ pub fn plural_uk(n: u64) -> usize {
 /// Portuguese integer plurals (CLDR `pt`): one (0, 1), other (2 and up).
 pub fn plural_pt(n: u64) -> usize {
     usize::from(n > 1)
+}
+
+/// Korean uses the same count form for every integer.
+fn plural_ko(_n: u64) -> usize {
+    0
+}
+
+/// Arabic integer plurals (CLDR `ar`): zero (0), one (1), two (2), few (3–10, 103–110),
+/// many (11–99) — the same rule pdfcraft uses, so the sibling apps agree.
+pub fn plural_arabic(n: u64) -> usize {
+    match (n, n % 100) {
+        (0, _) => 0,
+        (1, _) => 1,
+        (2, _) => 2,
+        (_, 3..=10) => 3,
+        (_, 11..=99) => 4,
+        _ => 5,
+    }
 }
 
 fn plural_en(n: u64) -> usize {

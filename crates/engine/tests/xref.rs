@@ -9,7 +9,7 @@ use cadcraft_engine::Session;
 use cadcraft_engine::cmd::file::{IoHooks, set_io};
 use cadcraft_engine::doc::color::Color;
 use cadcraft_engine::doc::geom::Vec3;
-use cadcraft_engine::doc::{Block, Circle, Drawing, Entity, EntityKind, Handle, Insert, Layer, Line, MAX_BLOCK_DEPTH, XrefStatus};
+use cadcraft_engine::doc::{Block, Circle, Drawing, Entity, EntityKind, Handle, Insert, Layer, Line, Linetype, MAX_BLOCK_DEPTH, XrefStatus};
 use serde_json::json;
 
 fn hooks() {
@@ -118,12 +118,14 @@ fn attach_loads_the_file_and_saving_keeps_only_the_reference() {
     let ext = d.extents(&cadcraft_engine::doc::Space::Model);
     assert!(ext.max.x >= 110.0 - 1e-9, "the xref is drawn where it was placed: {ext:?}");
 
-    // Saved: the xref block with its path and no objects, and none of its symbols.
+    // Saved: the xref block with its path and no objects, and none of its symbols but its layers
+    // (their settings in the host are the host's, #886).
     s.execute("qsave", &json!({})).unwrap();
     let saved = cadcraft_io::read(&std::fs::read(&host).unwrap(), "host.dxf").unwrap();
     let b = saved.block("site").unwrap();
     assert_eq!((b.xref_path.as_deref(), b.entities.len()), (Some("site.dxf"), 0));
-    assert!(saved.layers.iter().all(|l| !l.name.contains('|')));
+    assert_eq!(saved.layer("site|Walls").map(|l| l.color), Some(Color::Index(1)));
+    assert!(saved.linetypes.iter().all(|t| !t.name.contains('|')), "only the ones its layers use");
     assert!(saved.blocks.keys().all(|n| !n.contains('|')));
 
     // Reopened: loaded again from the file.
@@ -132,6 +134,37 @@ fn attach_loads_the_file_and_saving_keeps_only_the_reference() {
     assert_eq!(status(&t, "site"), Some(XrefStatus::Loaded));
     assert_eq!(objects(&t, "site"), 2);
     assert!(has_layer(&t, "site|Walls"));
+}
+
+#[test]
+fn xref_layer_overrides_survive_save_and_reopen_in_dxf_and_dwg() {
+    // #886: a colour and a freeze set in the host on the xref's layers are the host's (AutoCAD,
+    // VISRETAIN = 1), so they come back after saving and reopening instead of the xref's own.
+    hooks();
+    let dir = folder("overrides");
+    let mut x = site();
+    x.linetypes.push(Linetype::simple("Dashed", "Dashed", &[0.5, -0.25]));
+    x.layers.push(Layer { name: "Doors".into(), color: Color::Index(3), linetype: "Dashed".into(), ..Layer::default() });
+    save(&x, &dir.join("site.dxf"));
+    for ext in ["dxf", "dwg"] {
+        let host = dir.join(format!("host.{ext}"));
+        save(&host_with(&[("site.dxf", false)]), &host);
+        let mut s = Session::new();
+        open(&mut s, &host);
+        let d = s.doc_mut().unwrap();
+        d.layer_mut("site|Walls").unwrap().color = Color::Index(252);
+        d.layer_mut("site|Doors").unwrap().frozen = true;
+        s.execute("qsave", &json!({})).unwrap();
+
+        let mut t = Session::new();
+        open(&mut t, &host);
+        assert_eq!(status(&t, "site"), Some(XrefStatus::Loaded), "{ext}");
+        let d = t.doc().unwrap();
+        assert_eq!(d.layer("site|Walls").map(|l| l.color), Some(Color::Index(252)), "{ext}: the host's colour, not the xref's red");
+        assert_eq!(d.layer("site|Doors").map(|l| (l.frozen, l.color)), Some((true, Color::Index(3))), "{ext}: frozen in the host");
+        assert_eq!(d.layer("site|Doors").map(|l| l.linetype.as_str()), Some("site|Dashed"), "{ext}: its linetype is still the xref's");
+        assert!(d.linetype("site|Dashed").is_some(), "{ext}");
+    }
 }
 
 #[test]
@@ -401,4 +434,73 @@ fn hostile_xref_input_never_panics() {
     }
     let _ = s.execute("xopen", &json!({ "name": "nothing" }));
     let _ = s.execute("xopen", &json!({}));
+}
+
+/// A drawing with xrefs `(name, saved path)`, each placed at 0,0.
+fn host_with_paths(xrefs: &[(&str, &str)]) -> Drawing {
+    let mut d = Drawing::new_metric();
+    for (name, path) in xrefs {
+        let mut b = Block::new(name);
+        b.xref_path = Some(path.to_string());
+        d.blocks.insert(name.to_string(), Arc::new(b));
+        let h = d.new_handle();
+        d.model.push(Entity::new(h, insert(name, 0.0)));
+    }
+    d
+}
+
+#[test]
+fn saved_xref_paths_are_followed_beside_the_host_or_on_this_computer_only() {
+    hooks();
+    let base = folder("saved-paths");
+    let (dir, elsewhere) = (base.join("plans"), base.join("elsewhere"));
+    std::fs::create_dir_all(dir.join("parts")).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    save(&site(), &elsewhere.join("far.dxf"));
+    // A part beside the host that references drawings the same ways.
+    let mut nested = vec![("unc", r"\\192.0.2.1\share\far.dxf".to_string())];
+    // Read as a local path by Linux, and as a network path by the resolver.
+    let far_slashes = format!("/{}", elsewhere.join("far.dxf").display());
+    if cfg!(unix) {
+        nested.push(("slashes", far_slashes.clone()));
+    }
+    let mut part = host_with_paths(&nested.iter().map(|(n, p)| (*n, p.as_str())).collect::<Vec<_>>());
+    line(&mut part, "0", (0.0, 0.0), (1.0, 1.0));
+    save(&part, &dir.join("parts").join("part.dxf"));
+
+    let mut xrefs = vec![
+        ("unc", r"\\192.0.2.1\share\far.dxf".to_string()),
+        ("url", "file://192.0.2.1/s/far.dxf".to_string()),
+        ("part", "parts/part.dxf".to_string()),
+    ];
+    if cfg!(unix) {
+        xrefs.push(("slashes", far_slashes.clone()));
+    }
+    let host = dir.join("host.dxf");
+    save(&host_with_paths(&xrefs.iter().map(|(n, p)| (*n, p.as_str())).collect::<Vec<_>>()), &host);
+    let mut s = Session::new();
+    open(&mut s, &host);
+
+    assert_eq!(status(&s, "part"), Some(XrefStatus::Loaded), "a relative path beside the host: {:?}", s.log);
+    assert_eq!(objects(&s, "part"), 1 + nested.len(), "the part's line and references, with nothing loaded into them");
+    for name in ["unc", "url", "slashes"].into_iter().take(xrefs.len() - 1) {
+        assert_eq!((status(&s, name), objects(&s, name)), (Some(XrefStatus::Unresolved), 0), "{name}: {:?}", s.log);
+        assert!(s.log.iter().any(|m| m.contains(&format!("\"{name}\" not loaded")) && m.contains("another computer")), "{name}: {:?}", s.log);
+    }
+    assert!(s.log.iter().any(|m| m.contains("nested xref \"unc\" not loaded") && m.contains("another computer")), "{:?}", s.log);
+    if cfg!(unix) {
+        assert!(s.log.iter().any(|m| m.contains("nested xref \"slashes\" not loaded")), "{:?}", s.log);
+    }
+    let r = s.execute("-xref", &json!({ "option": "?" })).unwrap();
+    let found: Vec<(&str, bool)> = r["xrefs"].as_array().unwrap().iter().map(|x| (x["name"].as_str().unwrap(), x["foundAt"].is_string())).collect();
+    assert!(found.iter().all(|(n, f)| *f == (*n == "part")), "{found:?}");
+    assert!(s.execute("xopen", &json!({ "name": "unc" })).unwrap_err().to_string().contains("another computer"));
+    // Reloading follows the saved path the same way.
+    s.execute("-xref", &json!({ "option": "reload", "names": "*" })).unwrap();
+    assert_eq!(status(&s, "unc"), Some(XrefStatus::Unresolved));
+
+    // A path the user gives is used as given.
+    let far = elsewhere.join("far.dxf");
+    s.execute("-xref", &json!({ "option": "path", "names": "unc", "path": far.to_str().unwrap() })).unwrap();
+    assert_eq!(status(&s, "unc"), Some(XrefStatus::Loaded));
 }

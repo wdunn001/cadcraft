@@ -17,6 +17,11 @@ struct W {
     next: u64,
     /// Upper-case plot style name → its `ACDBPLACEHOLDER` handle (group 390 of layers and objects).
     pstyles: HashMap<String, String>,
+    /// Upper-case layer name → its LAYER table record handle (group 341 of viewports).
+    layers: HashMap<String, String>,
+    /// Persistent reactors of boundary objects: each source object of an associative hatch →
+    /// the hatches (groups `{ACAD_REACTORS 330 …}`), from [`hatch_reactors`].
+    reactors: HashMap<Handle, Vec<String>>,
 }
 
 impl W {
@@ -89,6 +94,9 @@ struct AssocObj {
 struct OsnapRef {
     osnap: i64,
     main: Handle,
+    /// The 1-based segment of a polyline the point is an end of (group 91, with subentity type
+    /// 73 = 2, edge); 0 for an object made of one curve.
+    segment: i64,
     param: f64,
     point: Vec3,
     other: Option<Handle>,
@@ -158,6 +166,32 @@ impl Ctx {
     }
 }
 
+/// The persistent reactors of boundary objects: each source object of an associative hatch in
+/// the same space or block → the hatches it bounds (AutoCAD links the two both ways; without the
+/// reactor the hatch no longer follows its boundary there).
+fn hatch_reactors(d: &Drawing) -> HashMap<Handle, Vec<String>> {
+    let mut out: HashMap<Handle, Vec<String>> = HashMap::new();
+    let stores = std::iter::once(&d.model).chain(d.layouts.iter().map(|l| &l.entities)).chain(d.blocks.values().map(|b| &b.entities));
+    for st in stores {
+        for e in st.iter() {
+            let EntityKind::Hatch(h) = &e.kind else { continue };
+            if !h.associative {
+                continue;
+            }
+            for s in h.loops.iter().flat_map(|l| &l.sources) {
+                if *s != e.handle && st.contains(*s) {
+                    let r = out.entry(*s).or_default();
+                    let own = e.handle.hex();
+                    if !r.contains(&own) {
+                        r.push(own);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// `AcadAnnotative` xdata marking an annotative style.
 fn annotative_xdata(w: &mut W) {
     w.s(1001, "AcadAnnotative");
@@ -170,7 +204,7 @@ fn annotative_xdata(w: &mut W) {
 
 /// Override (`ACAD` DSTYLE) and associativity (`CADCRAFT` ASSOC) xdata of a dimension.
 fn dim_xdata(w: &mut W, dm: &Dimension, cx: &Ctx) {
-    let mut ov = W { t: Vec::new(), next: 0, pstyles: HashMap::new() };
+    let mut ov = W { t: Vec::new(), next: 0, pstyles: HashMap::new(), layers: HashMap::new(), reactors: HashMap::new() };
     let mut sah = false;
     for (k, v) in &dm.overrides {
         let Some(field) = DimStyle::field_name(k) else { continue };
@@ -260,6 +294,50 @@ const HEADER_VARS: &[(&str, i32)] = &[
     ("PSLTSCALE", 70),
 ];
 
+/// The current dimension style's variables as header variables (`$DIMTXT`, `$DIMDEC`…), after
+/// `$DIMSTYLE`: AutoCAD draws new and updated dimensions with the header's DIM* values, which
+/// otherwise stay its defaults (0.18 text, 4 decimals) whatever the current style says (#1051).
+/// `$DIMSCALE` is a header variable of its own.
+fn dim_header_vars(w: &mut W, d: &Drawing) {
+    let name = d.header.str("DIMSTYLE", "Standard");
+    let Some(style) = d.dim_styles.iter().find(|s| s.name.eq_ignore_ascii_case(&name)) else { return };
+    let v = serde_json::to_value(style).unwrap_or_default();
+    let none = |_: &str| None;
+    for (var, field) in cadcraft_doc::DIMVARS {
+        if *var == "DIMSCALE" {
+            continue;
+        }
+        let (Some(value), Some((_, _, kind))) = (v.get(*field), dxf_ext::DIM_CODES.iter().find(|(f, _, _)| f == field)) else { continue };
+        match kind {
+            // Names, not handles, in the header.
+            K::TextStyle | K::Block => {
+                let Some(n) = value.as_str() else { continue };
+                if *kind == K::TextStyle && n.trim().is_empty() {
+                    continue;
+                }
+                w.s(9, format!("${var}"));
+                w.s(if *kind == K::TextStyle { 7 } else { 1 }, n);
+            }
+            K::Linetype => {}
+            _ => match dxf_ext::encode(*kind, value, &none, &none, &none) {
+                Some(DimVal::Real(x)) => {
+                    w.s(9, format!("${var}"));
+                    w.f(40, x);
+                }
+                Some(DimVal::Int(i)) if i16::try_from(i).is_ok() => {
+                    w.s(9, format!("${var}"));
+                    w.i(70, i);
+                }
+                Some(DimVal::Str(t)) => {
+                    w.s(9, format!("${var}"));
+                    w.s(1, t);
+                }
+                _ => {}
+            },
+        }
+    }
+}
+
 fn header_vars(w: &mut W, d: &Drawing) {
     for (name, code) in HEADER_VARS {
         let Some(v) = d.header.get(name) else { continue };
@@ -280,6 +358,8 @@ fn header_vars(w: &mut W, d: &Drawing) {
             (-2 | -3, _) => {}
             (c @ (40 | 50), v) => {
                 if let Some(f) = v.as_f64() {
+                    // ANGBASE is held in radians; `$ANGBASE` is in degrees.
+                    let f = if *name == "ANGBASE" { f.to_degrees() } else { f };
                     w.s(9, format!("${name}"));
                     w.f(c, f);
                 }
@@ -298,6 +378,7 @@ fn header_vars(w: &mut W, d: &Drawing) {
             }
         }
     }
+    dim_header_vars(w, d);
 }
 
 /// An entity's group 440 (DXF Reference): ByBlock is `0x01000000`, a fixed transparency its alpha
@@ -317,8 +398,13 @@ fn common(w: &mut W, e: &Entity, owner: &str, paper: bool, subclass: &str) {
 /// Common entity groups; `assoc` adds the reactor and extension dictionary of a DIMASSOC.
 fn common_x(w: &mut W, e: &Entity, owner: &str, paper: bool, subclass: &str, assoc: Option<&AssocObj>) {
     w.s(5, e.handle.hex());
+    let mut reactors: Vec<String> = assoc.map(|a| a.handle.clone()).into_iter().collect();
+    reactors.extend(w.reactors.get(&e.handle).into_iter().flatten().cloned());
+    if !reactors.is_empty() {
+        let rs: Vec<&str> = reactors.iter().map(String::as_str).collect();
+        w.group("ACAD_REACTORS", 330, &rs);
+    }
     if let Some(a) = assoc {
-        w.group("ACAD_REACTORS", 330, &[&a.handle]);
         w.group("ACAD_XDICTIONARY", 360, &[&a.xdict]);
     }
     w.s(330, owner);
@@ -382,13 +468,101 @@ fn attrib_common(d: &Drawing, e: &Entity, ins: &Insert, a: &Attrib) -> (Common, 
     (c, base)
 }
 
-/// ATTRIB/ATTDEF flags (group 70): 1 invisible, 2 constant.
-fn attrib_flags(a: &Attrib) -> i64 {
-    i64::from(a.invisible) | if a.constant { 2 } else { 0 }
+/// A multiline attribute's groups after its own (DXF 2007 and later): attribute type 2 (ATTRIB)
+/// or 4 (ATTDEF), its alignment point, then its text as embedded MTEXT (`101 Embedded Object`).
+/// Only what differs from unrotated text goes in the embedded object, as AutoCAD writes it.
+fn multiline_tags(w: &mut W, a: &Attrib, attdef: bool) {
+    let Some(m) = a.multiline_text() else { return };
+    w.i(71, if attdef { 4 } else { 2 });
+    w.i(72, if attdef { 0 } else { 1 });
+    w.p(11, a.text.align_pt.unwrap_or(a.text.insert));
+    w.s(101, "Embedded Object");
+    w.p(10, m.insert);
+    w.f(40, m.height);
+    w.f(41, m.width);
+    w.f(46, 0.0);
+    w.i(71, i64::from(m.attach));
+    w.i(72, 5);
+    let chars: Vec<char> = crate::dxf_read::mtext_dxf::encode_contents(&m.contents).chars().collect();
+    let chunks: Vec<String> = chars.chunks(250).map(|c| c.iter().collect()).collect();
+    let n = chunks.len();
+    for (i, c) in chunks.iter().enumerate() {
+        w.s(if i + 1 == n { 1 } else { 3 }, c.clone());
+    }
+    if n == 0 {
+        w.s(1, "");
+    }
+    w.s(7, &m.style);
+    if m.rotation != 0.0 {
+        w.p(11, Vec3::new(m.rotation.cos(), m.rotation.sin(), 0.0));
+    }
+    w.i(73, if m.line_spacing_exact { 2 } else { 1 });
+    w.f(44, m.line_spacing);
 }
 
-fn text_tags(w: &mut W, t: &Text, attrib_tag: Option<(&str, i64)>, attdef_prompt: Option<&str>) {
-    w.p(10, t.insert);
+/// ATTRIB/ATTDEF flags (group 70): 1 invisible, 2 constant, 4 verify, 8 preset.
+fn attrib_flags(a: &Attrib) -> i64 {
+    i64::from(a.invisible) | if a.constant { 2 } else { 0 } | if a.modes.verify { 4 } else { 0 } | if a.modes.preset { 8 } else { 0 }
+}
+
+/// A TEXT's groups, or an attribute's (`attrib`, in a file of version `target`) with its
+/// subclass: the subclass version (`280 0`, 2010 and later), prompt, tag, flags and alignment,
+/// then Lock position (`280`, 2007 and later; readers take the 280 after the tag as it).
+/// The insertion point (group 10) to write for `t`. A justified text is placed by its alignment
+/// point (group 11), and its insertion point is the start of its baseline, which AutoCAD reads
+/// from DWG as is (it recomputes it only for DXF): writing the alignment point there drew centred
+/// and right-aligned text from the wrong end in AutoCAD (#1050).
+///
+/// The stored point is kept when it is close to where CADCraft's font puts the baseline start:
+/// then it is AutoCAD's own (exact for its fonts). It is replaced when it is clearly stale: the
+/// alignment point itself (text made here) or a text whose length changed since. Close means
+/// along the baseline within a tenth of the text's width plus half its height (AutoCAD's fonts,
+/// or the ones CADCraft substitutes for them, differ most in width, and most on short texts) and
+/// across it within a fifth of its height: Left Middle and Left Bottom text made here, whose
+/// alignment point is only half or a third of a height from the baseline start, must not pass
+/// for AutoCAD's.
+fn text_insert(d: &Drawing, t: &Text) -> Vec3 {
+    let computed = computed_text_insert(d, t);
+    if t.align_pt.is_some_and(|a| a.xy() == t.insert.xy()) {
+        return computed;
+    }
+    let h = t.height.abs();
+    let off = (t.insert.xy() - computed.xy()).rotate(-t.rotation);
+    let close = if t.value.contains('\n') {
+        // A multiline attribute's lines are placed by its embedded MTEXT: a one-line baseline
+        // start says little about them, so only the distance counts.
+        let width = t.align_pt.map_or(0.0, |a| 2.0 * a.xy().dist(computed.xy()));
+        off.len() <= 0.1 * width + 0.5 * h
+    } else {
+        let width = cadcraft_fonts::line_width(&t.value, h, t.width_factor.abs());
+        off.x.abs() <= 0.1 * width + 0.5 * h && off.y.abs() <= 0.2 * h
+    };
+    if close { t.insert } else { computed }
+}
+
+fn computed_text_insert(d: &Drawing, t: &Text) -> Vec3 {
+    let justified = !matches!((t.halign, t.valign), (HAlign::Left, VAlign::Baseline) | (HAlign::Aligned | HAlign::Fit, _));
+    let Some(a) = t.align_pt.filter(|_| justified) else { return t.insert };
+    let ts = d.text_style(&t.style).cloned().unwrap_or_default();
+    let (h, v) = cadcraft_render::text_align(t.halign, t.valign);
+    let p = cadcraft_fonts::TextParams {
+        insert: t.insert.xy(),
+        align_pt: Some(a.xy()),
+        height: t.height,
+        rotation: t.rotation,
+        width_factor: t.width_factor,
+        oblique: t.oblique,
+        h,
+        v,
+        backwards: ts.backwards,
+        upside_down: ts.upside_down,
+    };
+    let q = cadcraft_fonts::baseline_start(&cadcraft_fonts::TextFont::resolve(&ts.font), &t.value, &p);
+    if q.is_finite() { Vec3::new(q.x, q.y, a.z) } else { t.insert }
+}
+
+fn text_tags(w: &mut W, d: &Drawing, t: &Text, attrib: Option<(&Attrib, Version)>, attdef_prompt: Option<&str>) {
+    w.p(10, text_insert(d, t));
     w.f(40, t.height);
     w.s(1, &t.value);
     if t.rotation != 0.0 {
@@ -421,16 +595,22 @@ fn text_tags(w: &mut W, t: &Text, attrib_tag: Option<(&str, i64)>, attdef_prompt
     if let Some(a) = t.align_pt {
         w.p(11, a);
     }
-    match attrib_tag {
-        Some((tag, flags)) => {
+    match attrib {
+        Some((a, target)) => {
             w.s(100, if attdef_prompt.is_some() { "AcDbAttributeDefinition" } else { "AcDbAttribute" });
+            if target >= Version::R2010 {
+                w.i(280, 0);
+            }
             if let Some(prompt) = attdef_prompt {
                 w.s(3, prompt);
             }
-            w.s(2, tag);
-            w.i(70, flags);
+            w.s(2, &a.tag);
+            w.i(70, attrib_flags(a));
             if v != 0 {
                 w.i(74, v);
+            }
+            if target >= Version::R2007 {
+                w.i(280, i64::from(a.modes.lock_position));
             }
         }
         None => {
@@ -615,7 +795,7 @@ fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx
             w.s(0, "TEXT");
             common(w, e, owner, paper, "AcDbText");
             thickness(w, e);
-            text_tags(w, t, None, None);
+            text_tags(w, d, t, None, None);
         }
         // Closed polylines, one per loop (`dxf_region`): REGION's own data is ACIS.
         EntityKind::Region(r) => {
@@ -635,7 +815,10 @@ fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx
         EntityKind::AttDef(a) => {
             w.s(0, "ATTDEF");
             common(w, e, owner, paper, "AcDbText");
-            text_tags(w, &a.text, Some((&a.tag, attrib_flags(a))), Some(&a.prompt));
+            text_tags(w, d, &a.text, Some((a, cx.target)), Some(&a.prompt));
+            if cx.target >= Version::R2007 {
+                multiline_tags(w, a, true);
+            }
         }
         EntityKind::MText(t) => {
             w.s(0, "MTEXT");
@@ -691,8 +874,15 @@ fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx
                     w.s(100, "AcDbEntity");
                     let (c, base) = attrib_common(d, e, i, a);
                     layer_and_props(w, &c, Some(&base));
+                    // Hidden with its definition (a dynamic block's visibility state hides it).
+                    if !base.visible {
+                        w.i(60, 1);
+                    }
                     w.s(100, "AcDbText");
-                    text_tags(w, &a.text, Some((&a.tag, attrib_flags(a))), None);
+                    text_tags(w, d, &a.text, Some((a, cx.target)), None);
+                    if cx.target >= Version::R2007 {
+                        multiline_tags(w, a, false);
+                    }
                 }
                 let sh = w.h();
                 w.s(0, "SEQEND");
@@ -723,6 +913,8 @@ fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx
                 DimKind::ArcLength => 1,
             };
             w.i(70, ty | 32 | if dm.user_text_pos { 128 } else { 0 });
+            // The actual measurement (read-only in DXF): AutoLISP's entget shows it.
+            w.f(42, g.measurement);
             if !dm.text.is_empty() {
                 w.s(1, &dm.text);
             }
@@ -820,6 +1012,9 @@ fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx
                     w.i(91, 0);
                     w.i(178, 0);
                     w.f(145, 0.0);
+                    if let Some(h) = cell.and_then(|x| x.text_height).filter(|h| h.is_finite() && *h > 0.0) {
+                        w.f(140, h);
+                    }
                     // Long text: 250-character code-2 chunks, the rest in code 1.
                     let chars: Vec<char> = cell.map(|x| x.text.chars().collect()).unwrap_or_default();
                     let chunks: Vec<String> = chars.chunks(250).map(|c| c.iter().collect()).collect();
@@ -911,8 +1106,11 @@ fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx
                         w.f(42, v.bulge);
                     }
                 }
-                // Source boundary objects of an associative hatch (the ones still in the drawing).
-                let sources: Vec<String> = l.sources.iter().filter(|s| h.associative && d.entity(**s).is_some()).map(|s| s.hex()).collect();
+                // Source boundary objects of an associative hatch (the ones still beside it, in
+                // its space or block, which carry the hatch as a reactor).
+                let own = e.handle.hex();
+                let sources: Vec<String> =
+                    l.sources.iter().filter(|s| h.associative && w.reactors.get(*s).is_some_and(|r| r.contains(&own))).map(|s| s.hex()).collect();
                 w.i(97, sources.len() as i64);
                 for s in &sources {
                     w.s(330, s);
@@ -971,6 +1169,13 @@ fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx
             w.i(90, flags);
             if let Some(h) = clip {
                 w.s(340, h.hex());
+            }
+            // AutoCAD's frozen-layer list: one soft pointer per layer, to its LAYER record. Other
+            // programs read only this; CADCraft prefers its own xdata below when present.
+            for name in &v.frozen_layers {
+                if let Some(h) = w.layers.get(&name.to_ascii_uppercase()).cloned() {
+                    w.s(341, h);
+                }
             }
             // One CADCraft xdata group holds both lists: readers stop at the first group of an app.
             if !v.frozen_layers.is_empty() || !v.layer_colors.is_empty() {
@@ -1183,8 +1388,16 @@ fn dim_block_entities(d: &Drawing, dm: &Dimension, layer: &str) -> Vec<Entity> {
     let style = d.dim_style(&dm.style).cloned().unwrap_or_default().with_overrides(&dm.overrides);
     let g = cadcraft_render::dimension_in(d, dm);
     let mut out = Vec::new();
-    let c = Common { layer: layer.into(), color: Color::ByBlock, ..Common::default() };
-    for l in &g.lines {
+    // Each part in its style colour (DIMCLRD, DIMCLRE, DIMCLRT), ByBlock when the style says so,
+    // as AutoCAD writes them: readers that draw the block drew every part ByBlock, i.e. in the
+    // dimension's own colour (#1052).
+    let in_color = |color: Color| Common { layer: layer.into(), color, ..Common::default() };
+    let (dim_c, ext_c, text_c) = (in_color(style.dim_line_color), in_color(style.ext_line_color), in_color(style.text_color));
+    for (i, l) in g.lines.iter().enumerate() {
+        let c = match g.line_roles.get(i) {
+            Some(cadcraft_render::LineRole::Ext) => &ext_c,
+            _ => &dim_c,
+        };
         for seg in l.windows(2) {
             if let [a, b] = seg {
                 out.push(Entity { handle: Handle(0), common: c.clone(), kind: EntityKind::Line(Line { a: a.to3(0.0), b: b.to3(0.0) }) });
@@ -1195,7 +1408,7 @@ fn dim_block_entities(d: &Drawing, dm: &Dimension, layer: &str) -> Vec<Entity> {
         if let [a, b, cc] = t.as_slice() {
             out.push(Entity {
                 handle: Handle(0),
-                common: c.clone(),
+                common: dim_c.clone(),
                 kind: EntityKind::Solid(Solid { corners: [a.to3(0.0), b.to3(0.0), cc.to3(0.0), cc.to3(0.0)] }),
             });
         }
@@ -1203,7 +1416,7 @@ fn dim_block_entities(d: &Drawing, dm: &Dimension, layer: &str) -> Vec<Entity> {
     if !g.value.is_empty() {
         out.push(Entity {
             handle: Handle(0),
-            common: c,
+            common: text_c,
             kind: EntityKind::MText(MText {
                 insert: g.text_pos.to3(0.0),
                 height: g.text_height,
@@ -1228,8 +1441,11 @@ fn table_size(t: &Table) -> (usize, usize) {
 
 /// The anonymous `*T` block of a table: cell fills, borders and texts as its cell styles draw
 /// them, for readers that only draw the block.
-fn table_block_entities(d: &Drawing, t: &Table, layer: &str) -> Vec<Entity> {
-    let g = cadcraft_render::table_geometry(d, t);
+///
+/// The block is relative to its own origin: the ACAD_TABLE reference adds the insertion point.
+pub(crate) fn table_block_entities(d: &Drawing, t: &Table, layer: &str) -> Vec<Entity> {
+    let at_origin = Table { insert: Vec3::ZERO, ..t.clone() };
+    let g = cadcraft_render::table_geometry(d, &at_origin);
     let c = Common { layer: layer.into(), color: Color::ByBlock, ..Common::default() };
     let mut out = Vec::new();
     for f in &g.fills {
@@ -1298,9 +1514,43 @@ fn arrow_block_entities(kind: cadcraft_render::Arrowhead) -> Vec<Entity> {
     out
 }
 
+/// Whether a DIMASSOC point reference to `k` names a point of it without naming a segment:
+/// true for objects made of one curve. Polylines are referenced by segment ([`polyline_vertex_ref`]);
+/// 3D polylines and multilines can't be yet, and references to them are left out, as AutoCAD
+/// otherwise resolved them to the first segment and changed the dimension's value (#1049).
+fn whole_object_ref(k: &EntityKind) -> bool {
+    !matches!(k, EntityKind::LwPolyline(_) | EntityKind::Polyline3d(_) | EntityKind::MLine(_))
+}
+
+/// A polyline vertex as AutoCAD references it (#1049): an end of one of its two segments,
+/// which are numbered from 1 (segment k runs from vertex k−1 to vertex k; a closed polyline's
+/// closing segment is the last). Returns (osnap, parameter, segment): the end of the incoming
+/// segment (osnap 1, parameter 1.0), else the start of the outgoing one (osnap 13, 0.0). Only
+/// straight segments are used, whose parameters are 0 and 1; a vertex between two arcs gets no
+/// reference.
+pub(crate) fn polyline_vertex_ref(p: &LwPolyline, index: usize) -> Option<(i64, f64, i64)> {
+    let n = p.vertices.len();
+    if index >= n || n < 2 {
+        return None;
+    }
+    let segments = if p.closed { n } else { n - 1 };
+    // Segment k (1-based) starts at vertex k−1; its bulge is that vertex's.
+    let straight = |k: usize| k >= 1 && k <= segments && p.vertices.get(k - 1).is_some_and(|v| v.bulge == 0.0);
+    let incoming = if index == 0 { if p.closed { Some(n) } else { None } } else { Some(index) };
+    let outgoing = (index < segments).then_some(index + 1);
+    // Vertex 0 as the start of segment 1, the others as the end of the segment before, as
+    // AutoCAD writes them when it can.
+    let preferred = if index == 0 {
+        [outgoing.map(|k| (13, 0.0, k)), incoming.map(|k| (1, 1.0, k))]
+    } else {
+        [incoming.map(|k| (1, 1.0, k)), outgoing.map(|k| (13, 0.0, k))]
+    };
+    preferred.into_iter().flatten().find(|(_, _, k)| straight(*k)).map(|(o, t, k)| (o, t, i64::try_from(k).unwrap_or(0)))
+}
+
 /// Standard DIMASSOC point references of an associative dimension: the extension-line
 /// origins of linear/aligned dimensions and the feature point of ordinate dimensions, linked
-/// to objects that exist. CADCraft's exact links travel in xdata as well.
+/// to objects that exist ([`whole_object_ref`]). CADCraft's exact links travel in xdata as well.
 fn std_assoc_refs(d: &Drawing, dm: &Dimension) -> (i64, Vec<OsnapRef>) {
     let slots: &[&str] = match dm.kind {
         DimKind::Linear { .. } | DimKind::Aligned => &["p13", "p14"],
@@ -1313,20 +1563,35 @@ fn std_assoc_refs(d: &Drawing, dm: &Dimension) -> (i64, Vec<OsnapRef>) {
         let Some(a) = dm.assoc.iter().find(|a| a.point == *name) else { continue };
         let Some(ent) = d.entity(a.handle) else { continue };
         let point = if *name == "p13" { dm.p13 } else { dm.p14 };
+        if let EntityKind::LwPolyline(p) = &ent.kind {
+            let index = match &a.snap {
+                AssocSnap::Vertex { index } => Some(*index),
+                AssocSnap::Start => Some(0),
+                AssocSnap::End => p.vertices.len().checked_sub(1),
+                _ => None,
+            };
+            let Some((osnap, param, segment)) = index.and_then(|i| polyline_vertex_ref(p, i)) else { continue };
+            flags |= 1 << slot;
+            refs.push(OsnapRef { osnap, main: a.handle, segment, param, point, other: None });
+            continue;
+        }
+        if !whole_object_ref(&ent.kind) {
+            continue;
+        }
         let (osnap, param, other) = match &a.snap {
             AssocSnap::Start | AssocSnap::End | AssocSnap::Vertex { .. } => (1, 0.0, None),
             AssocSnap::Mid => (2, 0.0, None),
             AssocSnap::Center => (if matches!(ent.kind, EntityKind::Point(_)) { 4 } else { 3 }, 0.0, None),
             AssocSnap::OnCircle { angle } => (10, *angle, None),
             AssocSnap::Intersection { other } => {
-                if d.entity(*other).is_none() {
+                if !d.entity(*other).is_some_and(|o| whole_object_ref(&o.kind)) {
                     continue;
                 }
                 (6, 0.0, Some(*other))
             }
         };
         flags |= 1 << slot;
-        refs.push(OsnapRef { osnap, main: a.handle, param, point, other });
+        refs.push(OsnapRef { osnap, main: a.handle, segment: 0, param, point, other });
     }
     (flags, refs)
 }
@@ -1455,14 +1720,37 @@ pub fn tags(d: &Drawing, version: Version) -> Vec<Tag> {
 /// The R2000 DXF the DWG bridge converts to a `dwg` version DWG: its entity types are the DWG
 /// version's (MULTILEADER from 2007).
 pub(crate) fn dwg_bridge(d: &Drawing, dwg: Version) -> String {
-    cadcraft_dxf::write_ascii(&tags_for(d, Version::R2000, dwg))
+    let mut tags = tags_for(d, Version::R2000, dwg);
+    bridge_markers(&mut tags);
+    cadcraft_dxf::write_ascii(&tags)
+}
+
+/// Subclass markers the DWG bridge knows by another spelling (it matches them exactly):
+/// AutoCAD writes a dynamic block lookup parameter's as `AcDbBlockLookUpParameter`, the bridge
+/// reads `AcDbBlockLookupParameter`; otherwise the parameter loses its name and its lookup
+/// action in the DWG, and AutoCAD's lookups stop working.
+fn bridge_markers(tags: &mut [Tag]) {
+    for t in tags.iter_mut().filter(|t| t.code == 100) {
+        if t.str().trim().eq_ignore_ascii_case("AcDbBlockLookupParameter") {
+            *t = Tag::s(100, "AcDbBlockLookupParameter");
+        }
+    }
 }
 
 /// The drawing's DXF tags, declaring `version` in `$ACADVER`, with what `target` (the version the
 /// file ends up in: `version`, or the DWG version the bridge writes) has.
 fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
+    // An in-place block edit in progress is not written: the drawing as before it.
+    let committed = d.committed();
+    let d: &Drawing = &committed;
     // Structural handles start above every entity handle.
-    let mut w = W { t: Vec::new(), next: d.handseed.max(0x100).saturating_add(0x1000), pstyles: HashMap::new() };
+    let mut w = W {
+        t: Vec::new(),
+        next: d.handseed.max(0x100).saturating_add(0x1000),
+        pstyles: HashMap::new(),
+        layers: HashMap::new(),
+        reactors: hatch_reactors(d),
+    };
     // Pre-allocate handles for block records.
     let mut paper_layouts: Vec<&Layout> = d.layouts.iter().collect();
     paper_layouts.sort_by_key(|l| l.tab_order);
@@ -1496,13 +1784,24 @@ fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
         for e in st.iter() {
             if let EntityKind::Dimension(dm) = &e.kind {
                 let reused = dim_plan.reuse.get(&e.handle);
-                let mut ents = dim_block_entities(d, dm, &e.common.layer);
+                let ents: Vec<Entity>;
                 let name = match reused {
+                    // A dimension still linked to the block it was read with hasn't changed since
+                    // (edits drop the link, and the screen draws that block): the block is written
+                    // as read, so other programs show it as they drew it.
+                    Some(b) if !b.entities.is_empty() => {
+                        ents = b.entities.iter().map(|x| x.as_ref().clone()).collect();
+                        reused_handles.extend(ents.iter().map(|x| x.handle).filter(|h| h.0 != 0));
+                        b.name.clone()
+                    }
                     Some(b) => {
-                        reuse_handles(&mut ents, b, &mut reused_handles);
+                        let mut fresh = dim_block_entities(d, dm, &e.common.layer);
+                        reuse_handles(&mut fresh, b, &mut reused_handles);
+                        ents = fresh;
                         b.name.clone()
                     }
                     None => {
+                        ents = dim_block_entities(d, dm, &e.common.layer);
                         let mut name = format!("*D{n}");
                         while d.block(&name).is_some() {
                             n += 1;
@@ -1720,7 +2019,7 @@ fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
         ltype_handles.entry(lt.name.to_ascii_uppercase()).or_insert(h.clone());
         cx.ltypes.entry(lt.name.to_ascii_uppercase()).or_insert(h);
         w.s(2, &lt.name);
-        w.i(70, 0);
+        w.i(70, if crate::dxf_xref::dependent(&lt.name) { 48 } else { 0 });
         w.s(3, &lt.description);
         w.i(72, 65);
         w.i(73, lt.pattern.len() as i64);
@@ -1754,9 +2053,12 @@ fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
     // LAYER
     let th = table_head(&mut w, "LAYER", d.layers.len());
     for l in &d.layers {
-        record_head(&mut w, "LAYER", &th, "AcDbLayerTableRecord");
+        let lh = record_head(&mut w, "LAYER", &th, "AcDbLayerTableRecord");
+        w.layers.insert(l.name.to_ascii_uppercase(), lh);
         w.s(2, &l.name);
-        w.i(70, i64::from(l.frozen) | if l.vp_freeze_new { 2 } else { 0 } | if l.locked { 4 } else { 0 });
+        // 16 | 32: an xref's layer (`xref|name`), externally dependent and resolved.
+        let xref = if crate::dxf_xref::dependent(&l.name) { 48 } else { 0 };
+        w.i(70, i64::from(l.frozen) | if l.vp_freeze_new { 2 } else { 0 } | if l.locked { 4 } else { 0 } | xref);
         let aci = match l.color {
             Color::True(rgb) => i64::from(cadcraft_color::nearest_aci(rgb)),
             c => i64::from(c.to_aci()).clamp(1, 255),
@@ -1915,9 +2217,19 @@ fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
         w.i(70, 0);
         let v = serde_json::to_value(s).unwrap_or_default();
         let defaults = serde_json::to_value(DimStyle::default()).unwrap_or_default();
-        let mut newer = W { t: Vec::new(), next: 0, pstyles: HashMap::new() };
+        let mut newer = W { t: Vec::new(), next: 0, pstyles: HashMap::new(), layers: HashMap::new(), reactors: HashMap::new() };
         for (field, code, kind) in dxf_ext::DIM_CODES {
             let Some(enc) = v.get(*field).and_then(|x| cx.encode(*kind, x)) else { continue };
+            // DIMPOST is written even when empty: a reader that defaults a missing one to "<>"
+            // (the DWG bridge's) would otherwise give radius and diameter dimensions no "R" or
+            // "Ø" in AutoCAD (#1053).
+            if *code == dxf_ext::DIMPOST
+                && let DimVal::Str(t) = &enc
+                && t.is_empty()
+            {
+                w.s(*code, "");
+                continue;
+            }
             if !dxf_ext::NEWER_CODES.contains(code) {
                 w.dimval(*code, enc, false);
                 continue;
@@ -2195,8 +2507,8 @@ fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
             w.s(1, "AcDbOsnapPointRef");
             w.i(72, r.osnap);
             w.s(331, r.main.hex());
-            w.i(73, 0);
-            w.i(91, 0);
+            w.i(73, if r.segment > 0 { 2 } else { 0 });
+            w.i(91, r.segment);
             w.s(301, "");
             w.f(40, r.param);
             w.p(10, r.point);
@@ -2256,17 +2568,18 @@ fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
             (45, page.height_mm),
             (46, 0.0),
             (47, 0.0),
-            (48, 0.0),
-            (49, 0.0),
-            (140, 0.0),
-            (141, 0.0),
+            (48, page.plot_window[0]),
+            (49, page.plot_window[1]),
+            (140, page.plot_window[2]),
+            (141, page.plot_window[3]),
             (142, scale),
             (143, 1.0),
         ] {
             w.f(c, v);
         }
         w.i(70, plot_flags);
-        w.i(72, 0);
+        // Plot paper units: 1 millimetres, 0 inches (#1058).
+        w.i(72, i64::from(cadcraft_render::paper::page_unit_mm(d, page) == 1.0));
         w.i(73, i64::from(page.landscape));
         w.i(74, plot_type);
         w.s(7, &page.plot_style_table);
@@ -2299,7 +2612,12 @@ fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
             w.s(1002, "}");
         }
     };
-    layout_obj(&mut w, &model_layout, "Model", 0, &ms_br, 1, &PageSetup::default(), None);
+    // Model space has no page setup of its own: write what PLOT does for it, the drawing extents
+    // fitted to the paper (plot type 1, scaled to fit). The default page's "layout" area is
+    // plot type 5, "Layout information" (DXF Reference, PLOTSETTINGS group 74), which means
+    // nothing for model space: another program's Plot dialog then shows no plot area or scale.
+    let model_page = PageSetup { plot_area: "extents".into(), scale_to_fit: true, ..PageSetup::default() };
+    layout_obj(&mut w, &model_layout, "Model", 0, &ms_br, 1, &model_page, None);
     for (i, (_, brh, l)) in ps_brs.iter().enumerate() {
         let h = layout_handles.get(i).cloned().unwrap_or_default();
         layout_obj(&mut w, &h, &l.name, i64::from(l.tab_order.max(1)), brh, 1, &l.page, l.view);
@@ -2313,6 +2631,7 @@ fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
         *t = Tag::s(5, seed);
     }
     crate::dxf_raw::finish(&mut w.t, d);
+    crate::dxf_raw::data_store(&mut w.t, d, target >= Version::R2013);
     add_class_instance_counts(&mut w.t);
     mark_xrefs(&mut w.t, d);
     w.t
@@ -2512,4 +2831,24 @@ fn scale_list(w: &mut W, scales: &[(&cadcraft_doc::AnnoScale, String)], dict: &s
 
 fn cadcraft_fonts_name() -> &'static str {
     "CADCraft Stroke"
+}
+
+/// One entity's DXF groups, as the writer stores them, without its `0` group: its type name
+/// and the groups of its record (an entity written as several records, a POLYLINE and its
+/// VERTEXes, gives its first). Handles of objects outside the entity (owner, styles) are left
+/// out. AutoLISP's `entget` is built on it.
+pub fn entity_groups(d: &Drawing, e: &Entity) -> (String, Vec<Tag>) {
+    let mut w = W {
+        t: Vec::new(),
+        next: d.handseed.max(0x100).saturating_add(0x1000),
+        pstyles: HashMap::new(),
+        layers: HashMap::new(),
+        reactors: HashMap::new(),
+    };
+    let cx = Ctx { target: Version::R2018, ..Ctx::default() };
+    let paper = d.space_of(e.handle).is_some_and(|s| !matches!(s, cadcraft_doc::Space::Model));
+    entity(&mut w, d, e, "0", paper, &cx);
+    let mut tags = w.t.into_iter();
+    let kind = tags.next().filter(|t| t.code == 0).map(|t| t.value.as_str()).unwrap_or_default();
+    (kind, tags.take_while(|t| t.code != 0).filter(|t| t.code != 330).collect())
 }

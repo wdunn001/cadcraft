@@ -49,6 +49,21 @@ fn gauss(a: f64, b: f64, f: impl Fn(f64) -> f64) -> f64 {
     GAUSS.iter().map(|(x, w)| w * f(m + h * x)).sum::<f64>() * h
 }
 
+/// Most halvings `adaptive_gauss` makes of one panel: with `param_at_length`'s 60 bisections
+/// this bounds the work a hostile spline can ask for.
+const MAX_GAUSS_DEPTH: usize = 10;
+
+/// `gauss` over [a, b], halving until the two halves agree with the whole: a fixed panel count
+/// is far off on a tight bend, and the arc-length inverse must agree with the measure.
+fn adaptive_gauss(a: f64, b: f64, whole: f64, f: &impl Fn(f64) -> f64, depth: usize) -> f64 {
+    let m = (a + b) / 2.0;
+    let (l, r) = (gauss(a, m, f), gauss(m, b, f));
+    if depth == 0 || !(l + r).is_finite() || (l + r - whole).abs() <= 1e-10 * (l + r).abs() {
+        return l + r;
+    }
+    adaptive_gauss(a, m, l, f, depth - 1) + adaptive_gauss(m, b, r, f, depth - 1)
+}
+
 /// Clamped knots over Bézier pieces meeting at `breaks`, for degree `p`.
 fn bezier_knots(breaks: &[f64], p: usize) -> Vec<f64> {
     let mut k = Vec::with_capacity(breaks.len() * p + 2);
@@ -109,8 +124,15 @@ impl Spline {
         if !self.is_valid() {
             return Vec2::ZERO;
         }
+        self.derivative_unchecked(t)
+    }
+
+    /// First derivative without re-validating the spline. The caller must have confirmed
+    /// [`Spline::is_valid`] already; integration calls this once per sample, and re-running the
+    /// O(knots) validity scan each time would make measuring a valid spline quadratic (CWE-407).
+    fn derivative_unchecked(&self, t: f64) -> Vec2 {
         let p = self.degree;
-        let n = self.control.len() - 1;
+        let Some(n) = self.control.len().checked_sub(1) else { return Vec2::ZERO };
         let (lo, hi) = self.domain();
         let t = if t.is_finite() { t.clamp(lo, hi) } else { lo };
         let span = find_span(n, p, t, &self.knots);
@@ -455,14 +477,22 @@ impl Spline {
         out
     }
 
-    /// Arc length between parameters `a` and `b` (Gauss–Legendre over each knot span).
+    /// Arc length of one integration panel. The spline is validated once by the public callers
+    /// ([`Spline::length_between`]/[`Spline::length`]) before any panel is measured, so the speed
+    /// closure uses the unchecked derivative to avoid re-scanning the knots per sample.
+    fn panel_length(&self, a: f64, b: f64) -> f64 {
+        let speed = |t: f64| self.derivative_unchecked(t).len();
+        adaptive_gauss(a, b, gauss(a, b, speed), &speed, MAX_GAUSS_DEPTH)
+    }
+
+    /// Arc length between parameters `a` and `b` (adaptive Gauss–Legendre over each knot span).
     pub fn length_between(&self, a: f64, b: f64) -> f64 {
         if !self.is_valid() || !(a.is_finite() && b.is_finite()) {
             return 0.0;
         }
         let (lo, hi) = self.domain();
         let (a, b) = (a.min(b).clamp(lo, hi), a.max(b).clamp(lo, hi));
-        let l: f64 = self.length_intervals(a, b).into_iter().map(|(x, y)| gauss(x, y, |t| self.derivative(t).len())).sum();
+        let l: f64 = self.length_intervals(a, b).into_iter().map(|(x, y)| self.panel_length(x, y)).sum();
         if l.is_finite() { l } else { 0.0 }
     }
 
@@ -476,11 +506,14 @@ impl Spline {
     /// backward for negative), clamped to the domain.
     pub fn param_at_length(&self, from: f64, len: f64) -> f64 {
         let (lo, hi) = self.domain();
+        if !self.is_valid() {
+            // Checked before `clamp`: an invalid spline's bounds may be reversed or NaN.
+            return if from.is_finite() { from } else { lo };
+        }
         let from = if from.is_finite() { from.clamp(lo, hi) } else { lo };
-        if !self.is_valid() || !len.is_finite() || len == 0.0 {
+        if !len.is_finite() || len == 0.0 {
             return from;
         }
-        let speed = |t: f64| self.derivative(t).len();
         let (a, b, target) = if len > 0.0 { (from, hi, len) } else { (lo, from, -len) };
         let mut ivs = self.length_intervals(a, b);
         if len < 0.0 {
@@ -488,7 +521,7 @@ impl Spline {
         }
         let mut acc = 0.0;
         for (x0, x1) in ivs {
-            let l = gauss(x0, x1, speed);
+            let l = self.panel_length(x0, x1);
             if acc + l >= target && l > 0.0 {
                 // Bisect inside this interval, measuring from its near end.
                 let rest = target - acc;
@@ -496,7 +529,7 @@ impl Spline {
                 let (mut s0, mut s1) = (near, far);
                 for _ in 0..60 {
                     let m = (s0 + s1) / 2.0;
-                    let lm = gauss(near.min(m), near.max(m), speed);
+                    let lm = self.panel_length(near.min(m), near.max(m));
                     if lm < rest {
                         s0 = m;
                     } else {
@@ -524,7 +557,14 @@ impl Ellipse {
         }
         let n = ((sweep / TAU) * 128.0).ceil().clamp(1.0, 512.0) as usize;
         let h = sweep / n as f64;
-        let l: f64 = (0..n).map(|i| gauss(t0 + h * i as f64, t0 + h * (i + 1) as f64, |t| self.derivative(t).len())).sum();
+        // Each panel halved where it needs it: a flat ellipse turns sharply at its ends.
+        let speed = |t: f64| self.derivative(t).len();
+        let l: f64 = (0..n)
+            .map(|i| {
+                let (a, b) = (t0 + h * i as f64, t0 + h * (i + 1) as f64);
+                adaptive_gauss(a, b, gauss(a, b, speed), &speed, MAX_GAUSS_DEPTH)
+            })
+            .sum();
         if l.is_finite() { l } else { 0.0 }
     }
 
@@ -696,6 +736,39 @@ mod tests {
     }
 
     #[test]
+    fn spline_arc_length_on_a_tight_bend() {
+        // One Bezier span that turns sharply: four fixed Gauss panels come out 0.3% short, and
+        // the inverse disagrees with the measure (#705). Reference by composite Simpson.
+        let pts = [(2.164, -9.484), (8.964, -13.012), (-16.428, -1.276), (18.58, -18.08)];
+        let s = Spline::from_control(pts.iter().map(|&(x, y)| Vec2::new(x, y)).collect(), 3);
+        let (lo, hi) = s.domain();
+        assert!((s.length() - 26.708_124_545_291_4).abs() < 1e-6, "{}", s.length());
+        for frac in [0.25, 0.5, 0.9] {
+            let want = s.length() * frac;
+            let t = s.param_at_length(lo, want);
+            assert!((s.length_between(lo, t) - want).abs() < 1e-6, "{frac}: {}", s.length_between(lo, t));
+            let t = s.param_at_length(hi, -want);
+            assert!((s.length_between(t, hi) - want).abs() < 1e-6, "{frac}: {}", s.length_between(t, hi));
+        }
+    }
+
+    #[test]
+    fn param_at_length_on_invalid_domain_does_not_panic() {
+        // Reversed bounds (knots out of order) and a NaN bound both make the spline invalid; a
+        // finite start must come back unchanged rather than reach `clamp` with bad bounds.
+        let mut reversed = cubic();
+        reversed.knots.reverse();
+        assert!(!reversed.is_valid() && reversed.domain().0 > reversed.domain().1);
+        let mut nan = cubic();
+        nan.knots[nan.degree] = f64::NAN;
+        assert!(!nan.is_valid() && nan.domain().0.is_nan());
+        for s in [reversed, nan] {
+            assert_eq!(s.param_at_length(0.5, 1.0), 0.5);
+            assert_eq!(s.param_at_length(0.5, -1.0), 0.5);
+        }
+    }
+
+    #[test]
     fn ellipse_arc_length() {
         let c = Ellipse::full(Vec2::ZERO, Vec2::new(3.0, 0.0), 1.0);
         assert!((c.length() - TAU * 3.0).abs() < 1e-9);
@@ -711,5 +784,8 @@ mod tests {
         assert!((t + FRAC_PI_2).abs() < 1e-9);
         assert!(e.param_at_length(0.0, e.length() * 2.0).is_none());
         assert!(e.param_at_length(f64::NAN, 1.0).is_none());
+        // A 100:1 ellipse, against the arithmetic-geometric mean's 40.010983297227.
+        let flat = Ellipse::full(Vec2::ZERO, Vec2::new(10.0, 0.0), 0.01);
+        assert!((flat.length() - 40.010_983_297_227).abs() < 1e-9, "{}", flat.length());
     }
 }

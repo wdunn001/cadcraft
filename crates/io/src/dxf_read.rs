@@ -105,6 +105,79 @@ fn attrib_props(t: &T, insert_layer: &str) -> AttribProps {
     }
 }
 
+/// An attribute's modes from its own groups: flags (70) 4 verify and 8 preset, and Lock
+/// position, the 280 after its tag in its subclass (a 280 before the tag is the subclass version).
+fn attrib_modes(own: &[Tag]) -> AttribModes {
+    let flags = own.iter().find(|t| t.code == 70).map(Tag::i64).unwrap_or(0);
+    let sub = own.iter().position(|t| t.code == 100 && t.str().trim().starts_with("AcDbAttribute")).unwrap_or(0);
+    let rest = own.get(sub..).unwrap_or_default();
+    let lock_position = rest.iter().position(|t| t.code == 2).is_some_and(|at| rest.iter().skip(at + 1).any(|t| t.code == 280 && t.i64() != 0));
+    AttribModes { verify: flags & 4 != 0, preset: flags & 8 != 0, lock_position }
+}
+
+/// An ATTRIB's or ATTDEF's groups split at its embedded multiline text (`101 Embedded Object`):
+/// the attribute's own groups and, for a multiline attribute, the MTEXT groups after the marker.
+fn split_embedded(tags: &[Tag]) -> (&[Tag], Option<&[Tag]>) {
+    match tags.iter().position(|t| t.code == 101) {
+        Some(i) => (tags.get(..i).unwrap_or(tags), tags.get(i + 1..)),
+        None => (tags, None),
+    }
+}
+
+/// A multiline attribute's text, from the MTEXT groups embedded in it.
+fn multiline_attrib(embedded: Option<&[Tag]>, c: &Common) -> Option<MultilineAttrib> {
+    let mtext = mtext_from(embedded.filter(|e| !e.is_empty())?, c);
+    let read_as = cadcraft_fonts::plain_mtext(&mtext.contents);
+    Some(MultilineAttrib { mtext, read_as })
+}
+
+/// Multiline text from MTEXT groups (an MTEXT entity's, or a multiline attribute's embedded ones).
+fn mtext_from(tags: &[Tag], c: &Common) -> MText {
+    let t = T(tags);
+    // Contents: code 3 chunks followed by code 1.
+    let mut contents = String::new();
+    for tg in tags.iter().filter(|x| x.code == 3) {
+        contents.push_str(&tg.str());
+    }
+    contents.push_str(&t.s(1).unwrap_or_default());
+    let contents = mtext_dxf::decode_contents(&contents);
+    let columns = mtext_dxf::read_columns(tags);
+    // The direction comes from the MTEXT's own groups only: in an R2018+ embedded object
+    // (group 101), 11 is the insertion point, not the X-axis direction (#667, as in #834).
+    let own = T(mtext_dxf::before_columns(tags));
+    let mut rotation = match (own.f(11), own.f(21)) {
+        (Some(x), Some(y)) if x != 0.0 || y != 0.0 => Vec2::new(x, y).angle(),
+        _ => own.fd(50, 0.0).to_radians(),
+    };
+    let mut attach = t.i(71).unwrap_or(1).clamp(1, 9) as u8;
+    if c.extrusion.z < 0.0 {
+        // Insertion point and direction are WCS, but the line height runs along extrusion ×
+        // direction: under (0,0,-1) the glyphs are mirrored. Drawn readable (MIRRTEXT = 0) with
+        // the same footprint, the text turns round and left/right attachment swap.
+        rotation = cadcraft_geom::norm_angle(rotation + std::f64::consts::PI);
+        attach = match attach {
+            1 | 4 | 7 => attach + 2,
+            3 | 6 | 9 => attach - 2,
+            a => a,
+        };
+    }
+    MText {
+        insert: t.p(10),
+        height: t.fd(40, 0.2).max(1e-9),
+        width: match &columns {
+            Some((_, w)) if t.fd(41, 0.0) <= 0.0 => *w,
+            _ => t.fd(41, 0.0).max(0.0),
+        },
+        attach,
+        rotation,
+        style: t.s(7).unwrap_or_else(|| "Standard".into()),
+        contents,
+        line_spacing: t.fd(44, 1.0),
+        line_spacing_exact: t.i(73) == Some(2),
+        columns: columns.map(|(c, _)| c),
+    }
+}
+
 fn text_from(t: &T) -> Text {
     let h = match t.i(72).unwrap_or(0) {
         1 => HAlign::Center,
@@ -172,6 +245,11 @@ fn mirror_text(t: &mut Text, align: Option<Vec3>, insert: Vec3) {
 
 /// Parse one entity record. POLYLINE/INSERT followers are handled by the caller.
 fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
+    entity_with_table_budget(kind, tags, &mut 4_000_000)
+}
+
+/// Parse one entity while charging materialized table cells to the caller's shared import budget.
+fn entity_with_table_budget(kind: &str, tags: &[Tag], table_cells_left: &mut usize) -> Option<(Common, EntityKind)> {
     // The paper-space viewport our writer adds (dxf_write::paper_view) stays implicit.
     if kind == "VIEWPORT" && crate::dxf_ext::is_paper_view(tags) {
         return None;
@@ -293,55 +371,27 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
         "RAY" => EntityKind::Ray(RayLine { base: t.p(10), dir: t.p(11) }),
         "XLINE" => EntityKind::XLine(RayLine { base: t.p(10), dir: t.p(11) }),
         "TEXT" => EntityKind::Text(text_from(&t)),
-        "MTEXT" => {
-            // Contents: code 3 chunks followed by code 1.
-            let mut contents = String::new();
-            for tg in tags.iter().filter(|x| x.code == 3) {
-                contents.push_str(&tg.str());
+        "MTEXT" => EntityKind::MText(mtext_from(tags, &c)),
+        "ATTDEF" => {
+            // A multiline definition has its text as embedded MTEXT after its own groups.
+            let (own, embedded) = split_embedded(tags);
+            let multiline = multiline_attrib(embedded, &c);
+            let own = T(own);
+            let mut text = text_from(&own);
+            if let Some(m) = &multiline {
+                text.value.clone_from(&m.read_as);
             }
-            contents.push_str(&t.s(1).unwrap_or_default());
-            let contents = mtext_dxf::decode_contents(&contents);
-            let columns = mtext_dxf::read_columns(tags);
-            let mut rotation = match (t.f(11), t.f(21)) {
-                (Some(x), Some(y)) if x != 0.0 || y != 0.0 => Vec2::new(x, y).angle(),
-                _ => T(mtext_dxf::before_columns(tags)).fd(50, 0.0).to_radians(),
-            };
-            let mut attach = t.i(71).unwrap_or(1).clamp(1, 9) as u8;
-            if c.extrusion.z < 0.0 {
-                // Insertion point and direction are WCS, but the line height runs along extrusion ×
-                // direction: under (0,0,-1) the glyphs are mirrored. Drawn readable (MIRRTEXT = 0) with
-                // the same footprint, the text turns round and left/right attachment swap.
-                rotation = cadcraft_geom::norm_angle(rotation + std::f64::consts::PI);
-                attach = match attach {
-                    1 | 4 | 7 => attach + 2,
-                    3 | 6 | 9 => attach - 2,
-                    a => a,
-                };
-            }
-            EntityKind::MText(MText {
-                insert: t.p(10),
-                height: t.fd(40, 0.2).max(1e-9),
-                width: match &columns {
-                    Some((_, w)) if t.fd(41, 0.0) <= 0.0 => *w,
-                    _ => t.fd(41, 0.0).max(0.0),
-                },
-                attach,
-                rotation,
-                style: t.s(7).unwrap_or_else(|| "Standard".into()),
-                contents,
-                line_spacing: t.fd(44, 1.0),
-                line_spacing_exact: t.i(73) == Some(2),
-                columns: columns.map(|(c, _)| c),
+            EntityKind::AttDef(Attrib {
+                tag: own.s(2).unwrap_or_default(),
+                text,
+                invisible: own.i(70).unwrap_or(0) & 1 != 0,
+                constant: own.i(70).unwrap_or(0) & 2 != 0,
+                prompt: own.s(3).unwrap_or_default(),
+                props: Default::default(),
+                multiline,
+                modes: attrib_modes(own.0),
             })
         }
-        "ATTDEF" => EntityKind::AttDef(Attrib {
-            tag: t.s(2).unwrap_or_default(),
-            text: text_from(&t),
-            invisible: t.i(70).unwrap_or(0) & 1 != 0,
-            constant: t.i(70).unwrap_or(0) & 2 != 0,
-            prompt: t.s(3).unwrap_or_default(),
-            props: Default::default(),
-        }),
         "INSERT" => {
             // A mirrored block reference comes with extrusion (0,0,-1): its insertion point, scale,
             // rotation and column spacing are in that OCS, where x runs the other way. In the WCS that
@@ -435,7 +485,7 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
             }
             k
         }
-        "ACAD_TABLE" => EntityKind::Table(acad_table(tags)),
+        "ACAD_TABLE" => EntityKind::Table(acad_table(tags, table_cells_left)),
         "VIEWPORT" => EntityKind::Viewport(Viewport {
             center: t.p(10),
             width: t.fd(40, 1.0),
@@ -480,7 +530,7 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
 
 /// An ACAD_TABLE entity: sizes, cell texts and merges (DXF Reference), plus CADCraft's
 /// title/header flags, text height and style name from xdata when present.
-fn acad_table(tags: &[Tag]) -> Table {
+fn acad_table(tags: &[Tag], table_cells_left: &mut usize) -> Table {
     const MAX_CELLS: usize = 1_000_000;
     let start = tags.iter().position(|x| x.code == 100 && x.str() == "AcDbTable").unwrap_or(0);
     let tail = tags.get(start..).unwrap_or(&[]);
@@ -494,6 +544,12 @@ fn acad_table(tags: &[Tag]) -> Table {
     if declared > MAX_CELLS || (declared > 10_000 && n_cells < declared) {
         rows = 0;
         cols = 0;
+    }
+    // Charge before any cell vector is materialized, including discarded tables.
+    let count = rows.saturating_mul(cols);
+    match table_cells_left.checked_sub(count) {
+        Some(left) => *table_cells_left = left,
+        None => return Table { insert: T(tags).p(10), ..Table::default() },
     }
     let size = |v: f64| if v.is_finite() && v > 0.0 { v } else { 0.27 };
     let mut row_heights: Vec<f64> = head.all_f(141).into_iter().take(rows).map(size).collect();
@@ -520,11 +576,25 @@ fn acad_table(tags: &[Tag]) -> Table {
         let mut text: String = cell.iter().filter(|x| x.code == 2 || x.code == 3).map(Tag::str).collect();
         text.push_str(&c.s(1).unwrap_or_default());
         let span = |code: i32| c.i(code).and_then(|v| u32::try_from(v).ok());
-        let merged = match (c.i(173).unwrap_or(0) != 0, span(176), span(175)) {
-            (true, Some(rs), Some(cs)) if rs >= 1 && cs >= 1 && (rs, cs) != (1, 1) => Some((rs, cs)),
+        // A merge starts at the cell whose span (rows 176, columns 175) is more than one cell.
+        // Its own merged flag (173) varies by writer: CADCraft sets it, while AutoCAD-style
+        // writers (acadrust 0.6.4) set it only on the cells the merge covers, whose span is 0.
+        let merged = match (span(176), span(175)) {
+            (Some(rs), Some(cs)) if rs >= 1 && cs >= 1 && (rs, cs) != (1, 1) => Some((rs, cs)),
             _ => None,
         };
-        flat.push(TableCell { text, merged, ..TableCell::default() });
+        // The cell's own text height: 140 outside the value block (301 … 304), where it is a number.
+        let mut in_value = false;
+        let mut text_height = None;
+        for x in cell {
+            match x.code {
+                301 => in_value = true,
+                304 => in_value = false,
+                140 if !in_value => text_height = Some(x.f64()).filter(|h| h.is_finite() && *h > 0.0 && *h < 1e9),
+                _ => {}
+            }
+        }
+        flat.push(TableCell { text, merged, text_height, ..TableCell::default() });
     }
     flat.resize(rows * cols, TableCell::default());
     let cells: Vec<Vec<TableCell>> = if cols == 0 { vec![Vec::new(); rows] } else { flat.chunks(cols).map(<[TableCell]>::to_vec).collect() };
@@ -538,7 +608,8 @@ fn acad_table(tags: &[Tag]) -> Table {
             (flags.first().is_some_and(|v| *v != 0), flags.get(1).is_some_and(|v| *v != 0), h, style)
         }
         // Other writers: a first row merged across every column reads as a title.
-        None => (cols > 1 && cells.first().and_then(|r| r.first()).and_then(|c| c.merged) == Some((1, cols as u32)), false, 0.18, "Standard".into()),
+        // Their text height is resolved to the table style's once the styles are read (`apply`).
+        None => (cols > 1 && cells.first().and_then(|r| r.first()).and_then(|c| c.merged) == Some((1, cols as u32)), false, 0.0, "Standard".into()),
     };
     let mut t = Table { insert: T(tags).p(10), col_widths, row_heights, cells, style, text_height, title, header, ..Table::default() };
     crate::dxf_table::read_table_xdata(tags, &mut t);
@@ -923,6 +994,8 @@ struct Rx {
     pstyles: HashMap<String, String>,
     /// Upper-case block name → associative array parameters from its BLOCK_RECORD.
     block_arrays: HashMap<String, cadcraft_doc::ArrayParams>,
+    /// LAYER record handle (upper case) → layer name (VIEWPORT group 341 frozen layers).
+    layers: HashMap<String, String>,
 }
 
 /// The plot style names of a file: the entries of the `ACAD_PLOTSTYLENAME` dictionary of the
@@ -1007,8 +1080,8 @@ fn entity_extras(kind: &str, tags: &[Tag], h: Handle, k: &mut EntityKind, rx: &m
                 rx.table_blocks.insert(b.to_ascii_uppercase());
             }
             let ours = crate::dxf_ext::xdata(tags, crate::dxf_ext::APP).iter().any(|t| t.code == 1000 && t.str() == "TABLE");
-            if !ours && let Some(sh) = t.s(342) {
-                rx.table_style_fix.push((h, sh.trim().to_ascii_uppercase()));
+            if !ours {
+                rx.table_style_fix.push((h, t.s(342).map(|sh| sh.trim().to_ascii_uppercase()).unwrap_or_default()));
             }
         }
         ("INSERT", EntityKind::Insert(ins)) => {
@@ -1021,12 +1094,28 @@ fn entity_extras(kind: &str, tags: &[Tag], h: Handle, k: &mut EntityKind, rx: &m
             }
             rx.mleader_fix.push((h, pending));
         }
+        // CADCraft's VPFROZEN xdata wins; otherwise AutoCAD's group 341 layer handles.
+        ("VIEWPORT", EntityKind::Viewport(v)) if v.frozen_layers.is_empty() => {
+            v.frozen_layers = tags
+                .iter()
+                .take_while(|t| t.code < 1000)
+                .filter(|t| t.code == 341)
+                .filter_map(|t| rx.layers.get(&t.str().trim().to_ascii_uppercase()).cloned())
+                .collect();
+        }
         _ => {}
     }
 }
 
-/// Parse a run of entity records (ENTITIES section or a block's body) into entities.
-fn parse_entities(recs: &[(String, Vec<Tag>)], d: &mut Drawing, rx: &mut Rx) -> Vec<(Option<String>, bool, Entity)> {
+/// Parse a run of entity records (ENTITIES section or a block's body) into entities. Records that
+/// can't be placed are counted in `skipped`.
+fn parse_entities(
+    recs: &[(String, Vec<Tag>)],
+    d: &mut Drawing,
+    rx: &mut Rx,
+    skipped: &mut usize,
+    table_cells_left: &mut usize,
+) -> Vec<(Option<String>, bool, Entity)> {
     let mut out = Vec::new();
     let mut i = 0;
     while let Some((kind, tags)) = recs.get(i) {
@@ -1034,7 +1123,7 @@ fn parse_entities(recs: &[(String, Vec<Tag>)], d: &mut Drawing, rx: &mut Rx) -> 
         let owner = crate::dxf_ext::owner(tags);
         let paper = t.i(67) == Some(1);
         let handle = t.s(5).and_then(|h| Handle::parse_hex(&h));
-        let mut kindent = entity(kind, tags);
+        let mut kindent = entity_with_table_budget(kind, tags, table_cells_left);
         if let Some((c, _)) = kindent.as_mut()
             && let Some(n) = entity_plot_style(tags, rx)
         {
@@ -1074,7 +1163,10 @@ fn parse_entities(recs: &[(String, Vec<Tag>)], d: &mut Drawing, rx: &mut Rx) -> 
                     let mut fs = if flags & 64 != 0 { polyface_faces(&verts, &faces) } else { mesh_faces(&verts, &t, flags) }
                         .into_iter()
                         .map(EntityKind::Face3d);
-                    let Some(first) = fs.next() else { continue };
+                    let Some(first) = fs.next() else {
+                        *skipped = skipped.saturating_add(1);
+                        continue;
+                    };
                     extra.extend(fs);
                     first
                 } else if flags & 8 != 0 {
@@ -1102,13 +1194,23 @@ fn parse_entities(recs: &[(String, Vec<Tag>)], d: &mut Drawing, rx: &mut Rx) -> 
                     while let Some((k2, t2)) = recs.get(i) {
                         if k2 == "ATTRIB" {
                             let tt = T(t2);
+                            // A multiline attribute has its text as embedded MTEXT after its own groups.
+                            let (own, embedded) = split_embedded(t2);
+                            let multiline = multiline_attrib(embedded, &common(&tt));
+                            let own = T(own);
+                            let mut text = text_from(&own);
+                            if let Some(m) = &multiline {
+                                text.value.clone_from(&m.read_as);
+                            }
                             attribs.push(Attrib {
-                                tag: tt.s(2).unwrap_or_default(),
-                                text: text_from(&tt),
-                                invisible: tt.i(70).unwrap_or(0) & 1 != 0,
+                                tag: own.s(2).unwrap_or_default(),
+                                text,
+                                invisible: own.i(70).unwrap_or(0) & 1 != 0,
                                 constant: false,
                                 prompt: String::new(),
                                 props: attrib_props(&tt, &ins_layer),
+                                multiline,
+                                modes: attrib_modes(own.0),
                             });
                             i += 1;
                         } else {
@@ -1123,7 +1225,12 @@ fn parse_entities(recs: &[(String, Vec<Tag>)], d: &mut Drawing, rx: &mut Rx) -> 
                     }
                 }
             }
-            "SEQEND" | "VERTEX" | "ATTRIB" => continue,
+            // A VERTEX or ATTRIB with no POLYLINE or INSERT before it; a stray SEQEND holds nothing.
+            "VERTEX" | "ATTRIB" => {
+                *skipped = skipped.saturating_add(1);
+                continue;
+            }
+            "SEQEND" => continue,
             _ => {}
         }
         if let Some((c, mut k)) = kindent {
@@ -1139,6 +1246,10 @@ fn parse_entities(recs: &[(String, Vec<Tag>)], d: &mut Drawing, rx: &mut Rx) -> 
                 extra.into_iter().map(|f| (owner.clone(), paper, Entity { handle: d.new_handle(), common: c.clone(), kind: f })).collect();
             out.push((owner, paper, Entity { handle: h, common: c, kind: k }));
             out.extend(more);
+        } else if kind == "HATCH" {
+            // Without boundary data. The other records `entity` returns nothing for are read
+            // elsewhere (the writer's paper viewport, the loops of a region).
+            *skipped = skipped.saturating_add(1);
         }
     }
     // Assign fresh handles to duplicates (hostile files).
@@ -1247,6 +1358,9 @@ fn header(tags: &[Tag], d: &mut Drawing) {
                 },
                 // $DIMJOGANG is in radians; the variable (like the style) holds degrees.
                 HVal::Real(r) if name == "DIMJOGANG" => HVal::Real((r.to_degrees() * 1e9).round() / 1e9),
+                // $ANGBASE is in degrees (a drawing measured from north has 90.0); the variable
+                // holds radians.
+                HVal::Real(r) if name == "ANGBASE" => HVal::Real(r.to_radians()),
                 hv => hv,
             };
             d.header.set(&name, hv);
@@ -1263,8 +1377,16 @@ fn annotative(tags: &[Tag]) -> bool {
 }
 
 /// A text style's font: CADCraft's own font name from `CADCRAFT` xdata (`1000 FONT`, name)
-/// while the font file is still the `txt` written for other readers, otherwise the file.
+/// while the font file is still the `txt` written for other readers; the TrueType family of the
+/// style's `ACAD` xdata (`1000` typeface) when it has no font file (how AutoCAD stores TrueType
+/// styles); otherwise the file.
 fn style_font(tags: &[Tag], file: String) -> String {
+    if file.trim().is_empty()
+        && let Some(face) =
+            crate::dxf_ext::xdata(tags, "ACAD").iter().find(|t| t.code == 1000).map(|t| t.str().trim().to_string()).filter(|f| !f.is_empty())
+    {
+        return face;
+    }
     let x = crate::dxf_ext::xdata(tags, crate::dxf_ext::APP);
     let own = x.windows(2).find_map(|w| match w {
         [m, n] if m.code == 1000 && m.str() == "FONT" && n.code == 1000 => Some(n.str()),
@@ -1277,6 +1399,7 @@ fn style_font(tags: &[Tag], file: String) -> String {
     }
 }
 
+/// Load symbol tables and resolve handle references, indexing layer names for case-insensitive updates.
 fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
     let recs = records(tags);
     // STYLE handle → name, or the shape file of an unnamed shape style (linetype elements).
@@ -1308,16 +1431,23 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
             "LTYPE" => {
                 rx.ltypes.insert(h.trim().to_ascii_uppercase(), n);
             }
+            "LAYER" => {
+                rx.layers.insert(h.trim().to_ascii_uppercase(), n);
+            }
             _ => {}
         }
     }
     let mut active_vport = false;
+    // Index of layers already appended, by lower-cased name, so each LAYER record updates or
+    // appends in O(1) instead of scanning the growing layer list — otherwise many distinct layer
+    // names make import quadratic (CWE-407).
+    let mut layer_index: HashMap<String, usize> = d.layers.iter().enumerate().map(|(i, l)| (l.name.to_ascii_lowercase(), i)).collect();
     for (kind, tg) in recs {
         let t = T(&tg);
         match kind.as_str() {
             "LAYER" => {
                 let name = t.s(2).unwrap_or_default();
-                if name.is_empty() {
+                if name.is_empty() || d.layers.len() >= MAX_OBJECTS {
                     continue;
                 }
                 let aci = t.i(62).unwrap_or(7);
@@ -1347,14 +1477,21 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                 if let Some(desc) = crate::dxf_ext::xdata(&tg, crate::dxf_ext::LAYER_DESCRIPTION_APP).iter().filter(|x| x.code == 1000).nth(1) {
                     l.description = desc.str();
                 }
-                match d.layer_mut(&name) {
-                    Some(x) => *x = l,
-                    None => d.layers.push(l),
+                match layer_index.get(&name.to_ascii_lowercase()) {
+                    Some(&i) => {
+                        if let Some(x) = d.layers.get_mut(i) {
+                            *x = l;
+                        }
+                    }
+                    None => {
+                        layer_index.insert(name.to_ascii_lowercase(), d.layers.len());
+                        d.layers.push(l);
+                    }
                 }
             }
             "LTYPE" => {
                 let name = t.s(2).unwrap_or_default();
-                if name.is_empty() || d.linetype(&name).is_some() {
+                if name.is_empty() || d.linetype(&name).is_some() || d.linetypes.len() >= MAX_OBJECTS {
                     continue;
                 }
                 let pattern = ltype_pattern(&tg, &ltype_styles);
@@ -1362,7 +1499,7 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
             }
             "STYLE" => {
                 let name = t.s(2).unwrap_or_default();
-                if name.is_empty() {
+                if name.is_empty() || d.text_styles.len() >= MAX_OBJECTS {
                     continue;
                 }
                 // 70 bit 4: vertical; 71 bits 2/4: backwards / upside down.
@@ -1444,7 +1581,7 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
             }
             "DIMSTYLE" => {
                 let name = t.s(2).unwrap_or_default();
-                if name.is_empty() {
+                if name.is_empty() || d.dim_styles.len() >= MAX_OBJECTS {
                     continue;
                 }
                 // Every variable with a DIMSTYLE group code; values the style can't take are
@@ -1543,6 +1680,11 @@ fn ltype_pattern(tags: &[Tag], styles: &HashMap<String, String>) -> Vec<DashElem
 
 /// Read a DXF file into a drawing.
 pub fn read(bytes: &[u8]) -> Result<Drawing> {
+    read_budgeted(bytes, 4_000_000)
+}
+
+/// Import DXF sections while sharing one materialized-table-cell budget across blocks and entity sections.
+fn read_budgeted(bytes: &[u8], mut table_cells_left: usize) -> Result<Drawing> {
     let tags = cadcraft_dxf::parse(bytes).map_err(|e| IoError::Format(e.to_string()))?;
     let secs = sections(&tags);
     if secs.is_empty() {
@@ -1550,11 +1692,26 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
     }
     let mut d = Drawing::new_imperial();
     d.layouts.clear();
+    // A file without $INSUNITS declares no units (#1209); only new drawings take the template's.
+    d.header.set_i64("INSUNITS", 0);
     let mut rx = Rx { pstyles: plot_style_names(&secs), ..Rx::default() };
     let mut blocks: Vec<(String, Vec3, String, Vec<(Option<String>, bool, Entity)>, i64)> = Vec::new();
     let mut layout_objs: Vec<(String, u32, String, PageSetup)> = Vec::new();
     let mut entities = Vec::new();
     let mut objs = Objects::default();
+    // Every handle another program's file already uses is taken before anything gets a new one:
+    // its $HANDSEED can be lower than its handles, and entities made while reading (the faces of
+    // a polyface mesh) would otherwise get handles that records further on still have. A file
+    // CADCraft wrote names its own next handle, above which its rebuilt records are numbered
+    // (#495), so it is left to that.
+    let ours = secs.iter().any(|s| s.name == "OBJECTS" && s.tags.iter().any(|t| t.code == 3 && t.str() == crate::dxf_ext::HANDSEED_KEY));
+    for t in secs.iter().filter(|_| !ours).flat_map(|s| s.tags.iter()).filter(|t| t.code == 5 || t.code == 105) {
+        if let Some(h) = Handle::parse_hex(t.str().trim()) {
+            d.bump_handseed(h);
+        }
+    }
+    let mut skipped = std::collections::BTreeMap::new();
+    count_skipped(&mut skipped, "(no section)", outside_sections(&tags));
     for s in &secs {
         match s.name.as_str() {
             "HEADER" => header(&s.tags, &mut d),
@@ -1567,6 +1724,7 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
                         rx.xref_paths.insert(t.s(2).unwrap_or_default().to_ascii_uppercase(), t.s(1).unwrap_or_default());
                     }
                 }
+                let mut n = 0;
                 let mut i = 0;
                 while let Some((k, tg)) = recs.get(i) {
                     if k == "BLOCK" {
@@ -1581,15 +1739,25 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
                             j += 1;
                         }
                         let body = recs.get(i + 1..j).unwrap_or(&[]);
-                        let ents = parse_entities(body, &mut d, &mut rx);
+                        let ents = parse_entities(body, &mut d, &mut rx, &mut n, &mut table_cells_left);
                         blocks.push((name, base, description, ents, xref));
                         i = j + 1;
                     } else {
+                        // A record outside any BLOCK ... ENDBLK pair.
+                        if k != "ENDBLK" {
+                            n = n.saturating_add(1);
+                        }
                         i += 1;
                     }
                 }
+                count_skipped(&mut skipped, "BLOCKS", n);
             }
-            "ENTITIES" => entities = parse_entities(&records(&s.tags), &mut d, &mut rx),
+            // A damaged file may split its entities over several ENTITIES sections (#865).
+            "ENTITIES" => {
+                let mut n = 0;
+                entities.extend(parse_entities(&records(&s.tags), &mut d, &mut rx, &mut n, &mut table_cells_left));
+                count_skipped(&mut skipped, "ENTITIES", n);
+            }
             "OBJECTS" => {
                 for (k, tg) in records(&s.tags) {
                     objs.add(&k, &tg);
@@ -1701,7 +1869,32 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
         d.layers.insert(0, Layer::default());
     }
     crate::dxf_raw::read(&secs, &mut d);
+    d.skipped_records = skipped;
     Ok(d)
+}
+
+fn count_skipped(skipped: &mut std::collections::BTreeMap<String, usize>, section: &str, n: usize) {
+    if n > 0 {
+        let c = skipped.entry(section.to_string()).or_insert(0);
+        *c = c.saturating_add(n);
+    }
+}
+
+/// Records between sections, which [`sections`] passes over: everything after an ENDSEC up to the
+/// next SECTION. Stray ENDSECs and the EOF hold nothing and don't count.
+fn outside_sections(tags: &[Tag]) -> usize {
+    let mut inside = false;
+    let mut n = 0usize;
+    for t in tags.iter().filter(|t| t.code == 0) {
+        match t.str().as_str() {
+            "SECTION" => inside = true,
+            "ENDSEC" => inside = false,
+            "EOF" => {}
+            _ if !inside => n = n.saturating_add(1),
+            _ => {}
+        }
+    }
+    n
 }
 
 /// A SORTENTSTABLE (DXF Reference, OBJECTS section): after its AcDbSortentsTable marker, the
@@ -1857,13 +2050,24 @@ impl Objects {
             }
         }
         for (h, sh) in &rx.table_style_fix {
-            if let Some(name) = self.names.get(sh) {
-                let _ = d.modify_entity(*h, |e| {
-                    if let EntityKind::Table(t) = &mut e.kind {
-                        t.style = name.clone();
+            let name = self.names.get(sh).cloned();
+            // A table from another writer has no scale of its own: its text height is its
+            // style's, so every cell style height applies as it is.
+            let height = {
+                let style = name.as_deref().unwrap_or("Standard");
+                d.table_styles
+                    .iter()
+                    .find(|s| s.name.eq_ignore_ascii_case(style))
+                    .map_or(cadcraft_doc::TableStyle::default().text_height, |s| s.text_height)
+            };
+            let _ = d.modify_entity(*h, |e| {
+                if let EntityKind::Table(t) = &mut e.kind {
+                    if let Some(name) = name {
+                        t.style = name;
                     }
-                });
-            }
+                    t.text_height = height;
+                }
+            });
         }
         // Parametric constraints and parameters.
         if let Some((c, p)) = self.xrecord_text(crate::dxf_ext::CONSTRAINTS_KEY).and_then(|t| crate::dxf_ext::parse_constraints(&t)) {
@@ -1965,7 +2169,9 @@ fn dimassoc(d: &mut Drawing, tags: &[Tag]) {
         let Some(main) = r.s(331).and_then(|h| Handle::parse_hex(&h)) else { continue };
         let other = r.s(332).and_then(|h| Handle::parse_hex(&h));
         let at = r.p(10).xy();
-        if let Some(snap) = infer_snap(d, r.i(72).unwrap_or(0), main, other, at) {
+        // A polyline's segment (subentity type 73 = 2, edge; 91 its 1-based index).
+        let segment = r.i(91).filter(|k| *k >= 1 && r.i(73) == Some(2));
+        if let Some(snap) = infer_snap(d, r.i(72).unwrap_or(0), main, other, at, segment) {
             links.push(DimAssoc { point: (*point).to_string(), handle: main, snap });
         }
     }
@@ -1978,9 +2184,18 @@ fn dimassoc(d: &mut Drawing, tags: &[Tag]) {
     }
 }
 
-/// A CADCraft snap from a DIMASSOC object snap type and point.
-fn infer_snap(d: &Drawing, osnap: i64, main: Handle, other: Option<Handle>, at: Vec2) -> Option<AssocSnap> {
+/// A CADCraft snap from a DIMASSOC object snap type and point, and for a polyline the segment
+/// the point is an end of: AutoCAD writes no usable point there (10/20 are 0, #1049), the segment
+/// and the osnap (1 its end, 13 its start) name the vertex.
+fn infer_snap(d: &Drawing, osnap: i64, main: Handle, other: Option<Handle>, at: Vec2, segment: Option<i64>) -> Option<AssocSnap> {
     let e = d.entity(main)?;
+    if let (EntityKind::LwPolyline(p), Some(k), 1 | 13) = (&e.kind, segment, osnap) {
+        let n = p.vertices.len();
+        let segments = if p.closed { n } else { n.saturating_sub(1) };
+        let k = usize::try_from(k).ok().filter(|k| *k <= segments)?;
+        let index = if osnap == 13 { k - 1 } else { k % n };
+        return Some(AssocSnap::Vertex { index });
+    }
     Some(match osnap {
         1 | 13 => match &e.kind {
             EntityKind::Line(l) => {
@@ -2028,6 +2243,9 @@ fn page_setup(t: &T) -> PageSetup {
         p.height_mm = w.max(h);
     }
     p.margins_mm = [mm(40, p.margins_mm[0]), mm(41, p.margins_mm[1]), mm(42, p.margins_mm[2]), mm(43, p.margins_mm[3])];
+    // Plot paper units 1: millimetres. 0 (inches) is left to MEASUREMENT: earlier CADCraft
+    // versions wrote 0 for every layout.
+    p.paper_mm = t.i(72) == Some(1);
     // Plot rotation 1 or 3 turns the media a quarter turn; media defined wider than tall is
     // already landscape.
     let rotated = matches!(t.i(73), Some(1 | 3));
@@ -2064,6 +2282,7 @@ fn page_setup(t: &T) -> PageSetup {
         _ => "layout",
     }
     .into();
+    p.plot_window = [t.fd(48, 0.0), t.fd(49, 0.0), t.fd(140, 0.0), t.fd(141, 0.0)].map(|v| if v.is_finite() { v } else { 0.0 });
     p.plot_style_table = t.s(7).unwrap_or_default();
     p
 }
@@ -2118,4 +2337,46 @@ fn helix(tags: &[Tag]) -> Helix {
         constrain: HelixConstrain::from_dxf(t.i(280).unwrap_or(2)),
     }
     .sanitized()
+}
+
+/// An entity from the groups of a DXF record of type `kind` (without its `0` group), as the
+/// reader makes it. AutoLISP's `entmake` and `entmod` are built on it.
+pub fn entity_from_groups(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
+    entity(&kind.to_ascii_uppercase(), tags)
+}
+
+#[cfg(test)]
+mod table_budget_tests {
+    use super::*;
+    /// Build synthetic table tags with a requested row and column count for allocation-budget checks.
+    fn table_tags(rows: i64, cols: i64) -> Vec<Tag> {
+        vec![Tag::s(100, "AcDbTable"), Tag::i(91, rows), Tag::i(92, cols), Tag::i(171, 1), Tag::s(1, "cell")]
+    }
+    /// A table that cannot fit allocates no cell grid, while a smaller table spends only its cell count.
+    #[test]
+    fn exhausted_budget_rejects_before_materializing_cells() {
+        let mut left = 3;
+        let table = acad_table(&table_tags(2, 2), &mut left);
+        assert!(table.cells.is_empty() && table.row_heights.is_empty() && table.col_widths.is_empty());
+        assert_eq!(left, 3);
+        let table = acad_table(&table_tags(1, 2), &mut left);
+        assert_eq!(table.cells[0].len(), 2);
+        assert_eq!(left, 1);
+    }
+    /// Tables in blocks and repeated entity sections consume one document-wide cell allowance.
+    #[test]
+    fn blocks_and_entity_sections_share_one_budget() {
+        let table = "0\nACAD_TABLE\n100\nAcDbTable\n91\n1\n92\n2\n171\n1\n1\ncell\n";
+        let dxf = format!(
+            "0\nSECTION\n2\nBLOCKS\n0\nBLOCK\n2\nTEST\n10\n0\n20\n0\n{table}0\nENDBLK\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n{table}0\nENDSEC\n0\nSECTION\n2\nENTITIES\n{table}0\nENDSEC\n0\nEOF\n"
+        );
+        let d = read_budgeted(dxf.as_bytes(), 2).unwrap();
+        let block = d.block("TEST").unwrap();
+        let count = |e: &Entity| match &e.kind {
+            EntityKind::Table(t) => t.cells.iter().map(Vec::len).sum::<usize>(),
+            _ => 0,
+        };
+        assert_eq!(block.entities.iter().map(|e| count(e)).sum::<usize>(), 2);
+        assert_eq!(d.model.iter().map(|e| count(e)).sum::<usize>(), 0);
+    }
 }
