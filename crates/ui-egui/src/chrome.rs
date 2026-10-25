@@ -577,7 +577,7 @@ pub fn start_page(app: &mut CadApp, ui: &mut egui::Ui) {
     );
     let mut y = left.top() + 140.0;
     let mut action = None;
-    for (label, cmd) in [("Open...", "open"), ("New", "new"), ("New (metric)", "new.metric"), ("Open sample drawing", "sample")] {
+    for (label, cmd) in [("New", "new"), ("New (metric)", "new.metric"), ("Open sample drawing", "sample")] {
         let br = Rect::from_min_size(pos2(left.left() + 34.0, y), vec2(220.0, 34.0));
         let resp = ui.interact(br, ui.id().with(("start", cmd)), Sense::click());
         p.rect_stroke(br, 2.0, Stroke::new(1.0, if resp.hovered() { t.text } else { t.text_dim }), egui::StrokeKind::Inside);
@@ -587,50 +587,11 @@ pub fn start_page(app: &mut CadApp, ui: &mut egui::Ui) {
         }
         y += 44.0;
     }
-    // Cloud file list in the left column, below the local commands.
-    let left_cloud = Rect::from_min_max(pos2(left.left() + 12.0, y + 12.0), pos2(left.right() - 12.0, left.bottom() - 12.0));
-    ui.scope_builder(egui::UiBuilder::new().max_rect(left_cloud), |ui| {
-        crate::cloud::open_section(app, ui);
+    let main = Rect::from_min_max(pos2(left.right() + 16.0, r.top() + 16.0), pos2(r.right() - 16.0, r.bottom() - 16.0));
+    ui.scope_builder(egui::UiBuilder::new().max_rect(main), |ui| {
+        crate::cloud::open_page(app, ui);
     });
-    let main = Rect::from_min_max(pos2(left.right() + 36.0, r.top() + 40.0), r.max);
-    p.text(main.min, egui::Align2::LEFT_TOP, crate::tl!("Recent"), egui::FontId::proportional(22.0), t.text);
-    let mut recent = None;
-    let mut y = main.top() + 44.0;
-    for (i, path) in app.ui.recent_files.iter().enumerate() {
-        let row = Rect::from_min_size(pos2(main.left(), y), vec2((r.right() - main.left() - 36.0).clamp(0.0, 640.0), 42.0));
-        let resp = ui.interact(row, ui.id().with(("recent", i)), Sense::click());
-        if resp.hovered() {
-            p.rect_filled(row, 2.0, t.control_hover.gamma_multiply(0.5));
-        }
-        let dir = std::path::Path::new(path).parent().map(|d| d.display().to_string()).unwrap_or_default();
-        let clip = p.with_clip_rect(row.shrink(2.0));
-        clip.text(pos2(row.left() + 10.0, row.top() + 13.0), egui::Align2::LEFT_CENTER, crate::menus::file_name(path), crate::theme::body(), t.text);
-        clip.text(pos2(row.left() + 10.0, row.top() + 30.0), egui::Align2::LEFT_CENTER, dir, crate::theme::small(), t.text_faint);
-        if resp.on_hover_text(path).clicked() {
-            recent = Some(path.clone());
-        }
-        y += 46.0;
-    }
-    if let Some(path) = recent {
-        app.open_path(&path);
-    } else if app.ui.recent_files.is_empty() {
-        p.text(
-            pos2(main.center().x, main.center().y),
-            egui::Align2::CENTER_CENTER,
-            crate::tl!("There is nothing here yet."),
-            egui::FontId::proportional(18.0),
-            t.text,
-        );
-        p.text(
-            pos2(main.center().x, main.center().y + 26.0),
-            egui::Align2::CENTER_CENTER,
-            crate::tl!("To get started, create or open a drawing."),
-            crate::theme::body(),
-            t.text_dim,
-        );
-    }
     match action {
-        Some("open") => app.start("ui.open"),
         Some("new") => {
             app.start("new");
             app.ui.start_tab = false;

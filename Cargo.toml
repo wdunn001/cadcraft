@@ -89,5 +89,9 @@ debug = 0
 
 # collab-craft 80bfaec pins storytold/craft-libs@289d562; unify with the encode-async tip.
 [patch."https://github.com/storytold/craft-libs"]
-craft-cloud = { git = "https://github.com/wdunn001/craft-libs", rev = "441d918" }
-craft-ui = { git = "https://github.com/wdunn001/craft-libs", rev = "441d918" }
+craft-cloud = { path = "../gh-craft-libs/crates/cloud" }
+craft-ui = { path = "../gh-craft-libs/crates/ui" }
+
+[patch."https://github.com/wdunn001/craft-libs"]
+craft-cloud = { path = "../gh-craft-libs/crates/cloud" }
+craft-ui = { path = "../gh-craft-libs/crates/ui" }

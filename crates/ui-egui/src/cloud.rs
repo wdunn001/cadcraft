@@ -295,6 +295,18 @@ impl CloudApp for CadApp {
         Some(self.tr("The drawing is saved as a DXF or DWG file in the folder above."))
     }
 
+    fn recents(&self) -> Vec<String> {
+        self.ui.recent_files.clone()
+    }
+
+    fn open_recent(&mut self, path: &str) {
+        let _ = self.run("open", json!({ "path": path }));
+    }
+
+    fn browse_local(&mut self) {
+        let _ = self.run("open", json!({}));
+    }
+
     fn style(&self, _ui: &Ui) -> craft_ui::cloud::CloudStyle {
         let t = Tokens::get();
         craft_ui::cloud::CloudStyle {
@@ -312,19 +324,8 @@ impl CloudApp for CadApp {
 
 // ---------------------------------------------------------------- where the pages are drawn
 
-/// The Cloud section of the Start tab (the Open page).
-///
-/// Beside the local picker, never in place of it. A build with no service
-/// configured draws none of it. An account badge over an empty list reads to a
-/// user as a broken window.
+/// File › Open chrome: Recent, Cloud, Shared with me, and This computer.
 pub fn open_section(app: &mut CadApp, ui: &mut Ui) {
-    if !available(app) {
-        return;
-    }
-    let t = Tokens::get();
-    ui.add_space(22.0);
-    ui.label(egui::RichText::new(crate::i18n::t("Cloud")).font(egui::FontId::proportional(15.0)).color(t.text));
-    ui.add_space(8.0);
     open_page(app, ui);
 }
 
@@ -335,7 +336,7 @@ pub fn open_section(app: &mut CadApp, ui: &mut Ui) {
 pub fn modal(app: &mut CadApp, ctx: &egui::Context) {
     let Some(page) = app.cloud_page else { return };
     let title = match page {
-        Page::Open => crate::i18n::t("Open from the Cloud"),
+        Page::Open => crate::i18n::t("Open"),
         Page::Save => crate::i18n::t("Save to the Cloud"),
     };
     let mut close = false;
