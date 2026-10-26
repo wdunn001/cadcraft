@@ -25,7 +25,7 @@ cadcraft-engine = { path = "crates/engine" }
 cadcraft-ui-egui = { path = "crates/ui-egui" }
 cadcraft-mcp = { path = "crates/mcp" }
 # Which paths stored in a drawing (xrefs, data links) may be opened.
-craft-docpath = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "82a24b006eefa036b43c09a67fb9a3fbd17ffe63" }
+craft-docpath = {version = "0.1.0", git = "https://github.com/wdunn001/craft-libs", branch = "quasarke"}
 
 # foundation
 thiserror = "2"
@@ -52,13 +52,13 @@ quick-xml = "0.41"
 
 # Encode-async + cloud UI (wdunn001/craft-libs on top of 289d562).
 # Main moved egui to 0.37; craft-ui cloud still targets 0.36 until #160 lands.
-craft-ui = { git = "https://github.com/wdunn001/craft-libs", rev = "441d918", features = ["serde", "cloud"] }
+craft-ui = {git = "https://github.com/wdunn001/craft-libs", branch = "quasarke", features = ["serde", "cloud"]}
 # Vendor-neutral cloud types (Entry, Capability); no socket, no provider, builds for wasm.
-craft-cloud = { git = "https://github.com/wdunn001/craft-libs", rev = "441d918" }
+craft-cloud = {git = "https://github.com/wdunn001/craft-libs", branch = "quasarke"}
 # Desktop and browser transports for the cloud pages above.
-craft-cloud-client = { git = "https://github.com/wdunn001/collab-craft", rev = "80bfaec" }
+craft-cloud-client = {git = "https://github.com/wdunn001/collab-craft", branch = "quasarke"}
 # The share dialog's backend: reaches CollabCraft's sharing API.
-collabcraft-share = { git = "https://github.com/wdunn001/collab-craft", rev = "80bfaec" }
+collabcraft-share = {git = "https://github.com/wdunn001/collab-craft", branch = "quasarke"}
 egui = "0.36"
 egui_kittest = "0.36"
 eframe = { version = "0.36", default-features = false }
@@ -88,7 +88,7 @@ codegen-units = 16
 debug = 0
 
 # collab-craft 80bfaec pins storytold/craft-libs@289d562; unify with the encode-async tip.
-[patch."https://github.com/storytold/craft-libs"]
+[patch."https://github.com/wdunn001/craft-libs"]
 craft-cloud = { path = "../gh-craft-libs/crates/cloud" }
 craft-ui = { path = "../gh-craft-libs/crates/ui" }
 
